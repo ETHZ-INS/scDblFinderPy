@@ -4,13 +4,13 @@ import scanpy as sc
 from anndata import AnnData
 import scipy.sparse as sp
 from sklearn.neighbors import NearestNeighbors
-from sklearn.model_selection import StratifiedKFold
 import xgboost as xgb
 import warnings
 
 from .clustering import fast_cluster
 from .doublet_generation import get_artificial_doublets
 from .misc import cxds2
+from .thresholding import _gdbr, doublet_thresholding_optim
 
 def compute_doublet_score(
     adata, 
@@ -23,14 +23,23 @@ def compute_doublet_score(
     samples_col=None, # R: samples=NULL
     use_gpu=False,
     random_state=42,
-    n_iters=1, # R default is technically 3
+    n_iters=2,
     # R parameter equivalents
     clust_cor=None, # clustCor
     prop_random=0.0, # propRandom
     aggregate_features=False, # aggregateFeatures
     score_metric='logloss', # metric
+    nrounds=None,
+    max_depth=5,
+    eta=0.3,
+    filter_unidentifiable=True,
+    unident_th=0.1,
     training_features='default', # trainingFeatures
     multi_sample_mode='split', # multiSampleMode
+    dbr=None,
+    dbr_sd=None,
+    dbr_per1k=0.008,
+    stringency=0.5,
     return_type='adata', 
     verbose=True
 ):
@@ -121,17 +130,22 @@ def compute_doublet_score(
                  samples_col=None, # Prevent infinite recursion
                  clust_cor=clust_cor, prop_random=prop_random, aggregate_features=aggregate_features,
                  score_metric=score_metric, training_features=training_features,
+                 dbr=dbr, dbr_sd=dbr_sd, dbr_per1k=dbr_per1k, stringency=stringency,
                  return_type='adata', verbose=False
              )
              
              # Collect results
              for idx, score in zip(adata_sub.obs_names, adata_sub.obs['scDblFinder_score']):
                  scores_map[idx] = score
+             for idx, c in zip(adata_sub.obs_names, adata_sub.obs['scDblFinder_class']):
+                 class_map[idx] = c
         
         # Assign back
         # Note: indices must match
         scores_series = pd.Series(scores_map)
         adata.obs['scDblFinder_score'] = scores_series[adata.obs_names].values
+        class_series = pd.Series(class_map)
+        adata.obs['scDblFinder_class'] = pd.Categorical(class_series[adata.obs_names].values)
         
         return adata
 
@@ -186,8 +200,10 @@ def compute_doublet_score(
     adata_art.obs['src'] = 'artificial'
     adata_art.obs['most_likely_origin'] = origins
     
-    # Prepare real adata for merge
-    adata_real = adata.copy()
+    # Prepare real adata for merge using raw counts explicitly.
+    # `adata.X` may have been altered during clustering/preprocessing steps.
+    X_real_counts = adata.layers['counts'] if 'counts' in adata.layers else adata.X
+    adata_real = AnnData(X=X_real_counts.copy(), obs=adata.obs.copy(), var=adata.var.copy())
     adata_real.obs['type'] = 'real'
     adata_real.obs['src'] = 'real'
     adata_real.obs['most_likely_origin'] = np.nan # Initially unknown check if string or nan
@@ -317,72 +333,155 @@ def compute_doublet_score(
     
     # Training mask
     train_mask = np.ones(adata_combined.n_obs, dtype=bool)
+    adata_combined.obs['include.in.training'] = True
     
     # Iterative Training
     # n_iters=1 means run once.
     
-    model = None
     scores = None
-    
-    for i in range(n_iters):
-        if verbose: print(f"Training iteration {i+1}/{n_iters}...")
-        
-        # Build feature matrix for current selection
-        # (Technically features don't change, just the training set excludes likely doublets from 'Real' class)
-        
-        X_features = adata_combined.obs[feature_cols].values
-        # Append PCA
-        X_pca = adata_combined.obsm['X_pca']
-        X_full = np.hstack([X_features, X_pca])
-        
-        # Train XGBoost
-        # R uses xgb.cv to find nrounds or fixed.
-        # We'll use a standard classifier for now.
-        
-        X_train = X_full[train_mask]
-        y_train = y[train_mask]
-        
-        # If all real are excluded? Unlikely.
-        
-        clf = xgb.XGBClassifier(
-            n_estimators=100, 
-            max_depth=4, 
-            learning_rate=0.1, 
-            objective='binary:logistic',
-            eval_metric='logloss',
-            n_jobs=-1
-        )
-        
-        clf.fit(X_train, y_train)
-        model = clf
-        
-        # Predict on ALL cells
-        # We need probabilities (scores)
-        probs = clf.predict_proba(X_full)[:, 1]
-        scores = probs
-        
-        # Update training mask for next iteration
-        # Remove real cells that look like doublets from 'singlet' training set
-        # R: excludes cells called as doublets in previous step? Or top X%?
-        # R code: `d$include.in.training[w] <- FALSE` where w is probable doublets.
-        # Simple heuristic: threshold?
-        # If n_iters > 1, we need a thresholding logic.
-        # For n_iters=1, we stop here.
-        
-        adata_combined.obs['scDblFinder_score'] = scores
-        
-        if i < n_iters - 1:
-            # Simple update for next iter: remove top 10% of real cells or based on threshold
-            # R uses doubletThresholding logic.
-            # Simplified: remove real cells with score > 0.5 (or dynamic)
-            # Just skipping complex logic for single iter request.
-            pass
 
-    # 7. Thresholding
-    # ---------------
-    # Apply threshold to call doublets
-    # Simple strategy: expected doublet rate logic or 0.5?
-    # R uses complex cost-based threshold optimization (minimizing classification error of artificial).
+    # R-style initial score seed before iterative xgboost training.
+    ratio_max = np.max(adata_combined.obs['ratio_doublets'].values)
+    ratio_scaled = adata_combined.obs['ratio_doublets'].values / max(ratio_max, 1e-12)
+    scores = (adata_combined.obs['cxds_score'].values + ratio_scaled) / 2.0
+    adata_combined.obs['scDblFinder_score'] = scores
+
+    # Match .scDblscore default handling when dbr.sd is not provided.
+    d_tmp = adata_combined.obs[['src']].copy()
+    gdbr = _gdbr(d_tmp, dbr=dbr, dbr_per1k=dbr_per1k)
+    dbr_sd_eff = dbr_sd if dbr_sd is not None else (0.3 * gdbr + 0.025)
+
+    # Build full design matrix once (features + PCA), equivalent to `preds` + `addVals`.
+    X_features = adata_combined.obs[feature_cols].values
+    X_pca = adata_combined.obsm['X_pca']
+    X_full = np.hstack([X_features, X_pca])
+
+    real_mask_all = adata_combined.obs['type'].values == 'real'
+    dbl_mask_all = ~real_mask_all
+
+    for i in range(n_iters):
+        if verbose:
+            print(f"Training iteration {i+1}/{n_iters}...")
+
+        iter_df = adata_combined.obs[["type", "src", clusters_col, "include.in.training"]].copy()
+        iter_df = iter_df.rename(columns={clusters_col: "cluster"})
+        iter_df["score"] = scores
+
+        # R equivalent: call thresholding with higher stringency (0.7) during training exclusion.
+        _, calls_iter = doublet_thresholding_optim(
+            iter_df,
+            dbr=dbr,
+            dbr_sd=dbr_sd_eff,
+            dbr_per1k=dbr_per1k,
+            stringency=0.7,
+        )
+        calls_iter = np.asarray(calls_iter)
+
+        # w1: high-scoring real cells.
+        w1_mask = real_mask_all & (calls_iter == 'doublet')
+        n_real = int(np.sum(real_mask_all))
+        if np.sum(w1_mask) > (n_real / 3.0):
+            cap_n = int(np.floor(0.2 * n_real))
+            real_idx = np.where(real_mask_all)[0]
+            ord_idx = real_idx[np.argsort(-scores[real_idx])]
+            keep_idx = ord_idx[:cap_n]
+            w1_mask = np.zeros_like(real_mask_all, dtype=bool)
+            w1_mask[keep_idx] = True
+
+        # w2: likely unidentifiable artificial doublets.
+        w2_mask = dbl_mask_all & (scores < unident_th) & bool(filter_unidentifiable)
+        n_dbl = int(np.sum(dbl_mask_all))
+        if bool(filter_unidentifiable) and np.sum(w2_mask) > (n_dbl / 4.0):
+            cap_n = int(np.floor(0.1 * n_dbl))
+            dbl_idx = np.where(dbl_mask_all)[0]
+            ord_idx = dbl_idx[np.argsort(scores[dbl_idx])]
+            keep_idx = ord_idx[:cap_n]
+            w2_mask = np.zeros_like(dbl_mask_all, dtype=bool)
+            w2_mask[keep_idx] = True
+
+        excluded = w1_mask | w2_mask | (~train_mask)
+
+        if verbose:
+            print(f"iter={i}, {int(np.sum(excluded))} cells excluded from training.")
+
+        train_idx = np.where(~excluded)[0]
+        if train_idx.size > 10 and np.unique(y[train_idx]).size == 2:
+            X_train = X_full[train_idx]
+            y_train = y[train_idx]
+
+            if nrounds is None:
+                dtrain = xgb.DMatrix(X_train, label=y_train)
+                cv_res = xgb.cv(
+                    params={
+                        'objective': 'binary:logistic',
+                        'eval_metric': score_metric,
+                        'max_depth': max_depth,
+                        'learning_rate': eta,
+                        'subsample': 0.75,
+                    },
+                    dtrain=dtrain,
+                    num_boost_round=200,
+                    nfold=5,
+                    early_stopping_rounds=2,
+                    seed=random_state,
+                    verbose_eval=False,
+                )
+                n_estimators = max(1, int(cv_res.shape[0]))
+            else:
+                n_estimators = int(max(1, nrounds))
+
+            clf = xgb.XGBClassifier(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=eta,
+                objective='binary:logistic',
+                eval_metric=score_metric,
+                subsample=0.75,
+                n_jobs=-1,
+                random_state=random_state,
+            )
+            clf.fit(X_train, y_train)
+            scores = clf.predict_proba(X_full)[:, 1]
+
+        adata_combined.obs['scDblFinder_score'] = scores
+
+        # Update difficulty proxy from model score similarly to R iterative update.
+        if 'most_likely_origin' in adata_combined.obs.columns:
+            origin_series = adata_combined.obs['most_likely_origin']
+            valid_origin = origin_series.notna().values
+            non_real_valid = dbl_mask_all & valid_origin
+            if np.any(non_real_valid):
+                class_diff = (
+                    pd.DataFrame({'origin': origin_series[non_real_valid].values, 'score': scores[non_real_valid]})
+                    .groupby('origin', sort=False)['score']
+                    .mean()
+                )
+                default_diff = float(class_diff.mean())
+                difficulty = np.full(adata_combined.n_obs, default_diff, dtype=float)
+                mapped = class_diff.reindex(origin_series.values)
+                mapped_vals = mapped.to_numpy(dtype=float)
+                m = ~np.isnan(mapped_vals)
+                difficulty[m] = 1.0 - mapped_vals[m]
+                adata_combined.obs['difficulty'] = difficulty
+
+        train_mask = ~excluded
+        adata_combined.obs['include.in.training'] = train_mask
+
+    # 7. Thresholding (optim)
+    # -----------------------
+    # Keep parity with the R `optim` threshold path used in the current flow.
+    threshold_df = adata_combined.obs[["type", "src", clusters_col, "include.in.training"]].copy()
+    threshold_df = threshold_df.rename(columns={clusters_col: "cluster"})
+    threshold_df["score"] = scores
+    final_threshold, final_calls = doublet_thresholding_optim(
+        threshold_df,
+        dbr=dbr,
+        dbr_sd=dbr_sd_eff,
+        dbr_per1k=dbr_per1k,
+        stringency=stringency,
+    )
+    adata_combined.obs['scDblFinder_threshold'] = final_threshold
+    adata_combined.obs['scDblFinder_class'] = pd.Categorical(final_calls)
     
     # Let's map scores back to original `adata`
     # We only care about 'real' cells
@@ -401,15 +500,8 @@ def compute_doublet_score(
         pass
         
     adata.obs['scDblFinder_score'] = final_scores
-    
-    # Simple thresholding for now
-    # top x% based on expected rate?
-    # dbr = 0.01 * n_cells/1000 (roughly 1% per 1000 cells is 10x standard)
-    expected_rate = 0.008 * (n_cells / 1000.0) # Standard 10x approximation
-    n_expected = int(expected_rate * n_cells)
-    
-    # Alternatively determine threshold from artificial doublets misclassification
-    # But for "integration code" just adding the score is most important.
+    adata.obs['scDblFinder_class'] = pd.Categorical(np.asarray(final_calls)[real_mask])
+    adata.uns['scDblFinder_threshold'] = float(final_threshold)
     
     if return_type == 'full':
         return adata_combined
@@ -439,8 +531,12 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
     
     # Train KNN
     # Using sklearn for consistency, or scanpy
-    nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', n_jobs=-1).fit(X_pca)
+    # Match R/BiocNeighbors behavior by excluding each point itself from neighbors.
+    nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm='auto', n_jobs=-1).fit(X_pca)
     distances, indices = nbrs.kneighbors(X_pca)
+    # Drop self-neighbor column (typically first, with distance 0 and identical index).
+    distances = distances[:, 1:]
+    indices = indices[:, 1:]
     
     n_obs = X_obs = X_pca.shape[0]
     
