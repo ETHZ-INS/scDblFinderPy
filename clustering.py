@@ -192,4 +192,3 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
     if verbose:
         n_found = len(adata.obs[key_added].unique())
         print(f"Fast clustering found {n_found} clusters.")
-        

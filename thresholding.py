@@ -2,6 +2,26 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
 
+from .doublet_generation import get_expected_doublets
+
+def _estimate_heterotypic_db_rate(d, dbr=None, dbr_per1k=0.008):
+    """Estimate the rate of heterotypic doublets."""
+    dbr_global = _gdbr(d, dbr=dbr, dbr_per1k=dbr_per1k)
+    
+    if "cluster" not in d.columns or d["cluster"].nunique(dropna=True) <= 1:
+        th = float(np.sum(d["src"] == "artificial")) / len(d)
+        is_art = (d["src"] == "artificial")
+        if np.sum(is_art) == 0:
+            return dbr_global
+        prop_homo = float(np.sum(is_art & (d["score"] < th))) / np.sum(is_art)
+        return dbr_global * (1.0 - prop_homo)
+        
+    d_real = d[d["src"] == "real"]
+    if d_real.empty:
+        return dbr_global
+        
+    expected_dict = get_expected_doublets(d_real["cluster"], dbr=dbr_global, only_heterotypic=True, dbr_per_1k=dbr_per1k)
+    return float(np.sum(list(expected_dict.values())) / len(d_real))
 
 def _prop_homotypic(clusters):
     """Estimate expected homotypic-pair proportion from cluster frequencies."""
@@ -96,6 +116,8 @@ def optim_threshold(data, dbr=None, dbr_sd=None, stringency=0.5, dbr_per1k=0.008
     dbr_global = _gdbr(d, dbr=dbr, dbr_per1k=dbr_per1k)
     if dbr_sd is None:
         dbr_sd = 0.4 * dbr_global
+    # Now overwrite dbr_global with the heterotypic rate
+    dbr_global = _estimate_heterotypic_db_rate(d, dbr=dbr_global, dbr_per1k=dbr_per1k)
     dbr_bounds = np.array([dbr_global], dtype=float)
     if dbr_sd is not None:
         dbr_bounds = np.array([max(0.0, dbr_global - dbr_sd), min(1.0, dbr_global + dbr_sd)], dtype=float)

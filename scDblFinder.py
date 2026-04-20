@@ -9,33 +9,33 @@ import warnings
 
 from .clustering import fast_cluster
 from .doublet_generation import get_artificial_doublets
-from .misc import cxds2
+from .misc import cxds2, select_features
 from .thresholding import _gdbr, doublet_thresholding_optim
 
 def compute_doublet_score(
     adata, 
     n_neighbors=None,
-    n_features=1000, 
-    n_components=30,
+    n_features=1352, 
+    n_components=20,
     artificial_doublets_ratio=1.0, # Approx ratio to n_cells or fixed number? R uses fixed formula.
     n_artificial=None,
-    clusters_col='clusters',
+    clusters_col=None,
     samples_col=None, # R: samples=NULL
     use_gpu=False,
     random_state=42,
-    n_iters=2,
+    n_iters=3,
     # R parameter equivalents
     clust_cor=None, # clustCor
     prop_random=0.0, # propRandom
+    prop_markers=0.0, # propMarkers
     aggregate_features=False, # aggregateFeatures
     score_metric='logloss', # metric
-    nrounds=None,
-    max_depth=5,
+    nrounds=0.25,
+    max_depth=4,
     eta=0.3,
     filter_unidentifiable=True,
-    unident_th=0.1,
+    unident_th=None,
     training_features='default', # trainingFeatures
-    multi_sample_mode='split', # multiSampleMode
     dbr=None,
     dbr_sd=None,
     dbr_per1k=0.008,
@@ -94,60 +94,8 @@ def compute_doublet_score(
         If return_type='full', returns combined object.
     """
     
-    # 0. Handle Multi-Sample Mode
-    # ---------------------------
-    # R default is "split". Here we implement the basic split logic wrapper if requested.
-    if samples_col is not None and multi_sample_mode == 'split':
-        if verbose: print(f"Processing samples separately (mode='{multi_sample_mode}')...")
-        # Split logic: run compute_doublet_score on each subset and recombine.
-        # This is a recursive call pattern.
-        
-        # Check if samples_col exists
-        if samples_col not in adata.obs:
-             raise ValueError(f"Sample column '{samples_col}' not found.")
-             
-        samples = adata.obs[samples_col].unique()
-        # Create a copy or view? We want to modify original in place eventually.
-        # But for 'split', we compute scores and merge.
-        
-        scores_map = {}
-        class_map = {}
-        
-        # Simple loop (BPPARAM ignored for this basic implementation)
-        from tqdm import tqdm
-        iterator = tqdm(samples) if verbose else samples
-        
-        for s in iterator:
-             mask = adata.obs[samples_col] == s
-             adata_sub = adata[mask].copy()
-             
-             # Recurse with samples_col=None to treat as single sample
-             adata_sub = compute_doublet_score(
-                 adata_sub, n_neighbors=n_neighbors, n_features=n_features,
-                 n_components=n_components, artificial_doublets_ratio=artificial_doublets_ratio,
-                 n_artificial=None, clusters_col=clusters_col, use_gpu=use_gpu,
-                 random_state=random_state, n_iters=n_iters, 
-                 samples_col=None, # Prevent infinite recursion
-                 clust_cor=clust_cor, prop_random=prop_random, aggregate_features=aggregate_features,
-                 score_metric=score_metric, training_features=training_features,
-                 dbr=dbr, dbr_sd=dbr_sd, dbr_per1k=dbr_per1k, stringency=stringency,
-                 return_type='adata', verbose=False
-             )
-             
-             # Collect results
-             for idx, score in zip(adata_sub.obs_names, adata_sub.obs['scDblFinder_score']):
-                 scores_map[idx] = score
-             for idx, c in zip(adata_sub.obs_names, adata_sub.obs['scDblFinder_class']):
-                 class_map[idx] = c
-        
-        # Assign back
-        # Note: indices must match
-        scores_series = pd.Series(scores_map)
-        adata.obs['scDblFinder_score'] = scores_series[adata.obs_names].values
-        class_series = pd.Series(class_map)
-        adata.obs['scDblFinder_class'] = pd.Categorical(class_series[adata.obs_names].values)
-        
-        return adata
+    if samples_col is not None:
+        warnings.warn("multi_sample_mode has been removed; samples_col is ignored.")
 
     # 1. Preprocessing & Clustering
     # -----------------------------
@@ -168,15 +116,38 @@ def compute_doublet_score(
     # We work with a copy for processing to avoid modifying input too much until end
     # But for clustering we might modify input
     
-    if clusters_col not in adata.obs:
-        if verbose: print("Clustering cells...")
-        fast_cluster(adata, n_features=n_features, n_components=n_components, 
-                     key_added=clusters_col, use_gpu=use_gpu, random_state=random_state, 
-                     verbose=verbose)
+    if clusters_col:
+        if clusters_col not in adata.obs:
+            if verbose: print("Clustering cells...")
+            fast_cluster(adata, n_features=n_features, n_components=n_components, 
+                         key_added=clusters_col, use_gpu=use_gpu, random_state=random_state,
+                         verbose=verbose)
+        
+        clusters = adata.obs[clusters_col].values
+        n_clusters = len(np.unique(clusters))
+    else:
+        clusters = None
+        n_clusters = 1
+
+    if unident_th is None:
+        unident_th = 0.2 if clusters is None else 0.0
+        
+    adata_orig = adata
     
-    clusters = adata.obs[clusters_col].values
-    n_clusters = len(np.unique(clusters))
-    
+    # Feature Selection
+    # -----------------
+    if n_features is not None and adata.n_vars > n_features:
+        if verbose:
+            print(f"Selecting top {n_features} features...")
+        sel_features = select_features(
+            adata, 
+            clusters=clusters, 
+            n_features=n_features, 
+            prop_markers=prop_markers
+        )
+        # Keep original metadata from adata but apply subset for the rest of pipeline
+        adata = adata[:, sel_features].copy()
+        
     # 2. Artificial Doublet Generation
     # --------------------------------
     n_cells = adata.n_obs
@@ -190,7 +161,12 @@ def compute_doublet_score(
     X_counts = adata.layers['counts'] if 'counts' in adata.layers else adata.X
     
     # This returns a dictionary {"counts": ..., "origins": ...}
-    res = get_artificial_doublets(X_counts, n=n_artificial, clusters=clusters)
+    res = get_artificial_doublets(
+        X_counts, 
+        n=n_artificial, 
+        clusters=clusters,
+        prop_random=prop_random
+    )
     X_artificial = res['counts']
     origins = res['origins']
     
@@ -264,7 +240,6 @@ def compute_doublet_score(
     
     sc.pp.normalize_total(adata_combined, target_sum=1e4)
     sc.pp.log1p(adata_combined)
-    sc.pp.highly_variable_genes(adata_combined, n_top_genes=n_features)
     sc.pp.pca(adata_combined, n_comps=n_components)
     
     # 5. KNN & Doublet Features
@@ -273,8 +248,8 @@ def compute_doublet_score(
     
     if n_neighbors is None:
          # R heuristic? default k is often based on dataset size
-        n_neighbors = int(0.01 * n_cells)
-        n_neighbors = max(10, min(100, n_neighbors))
+        n_neighbors = int(np.round(0.01 * n_cells))
+        n_neighbors = max(20, min(100, n_neighbors))
         
     knn_features = _evaluate_knn(adata_combined, n_neighbors=n_neighbors, use_gpu=use_gpu)
     
@@ -309,9 +284,10 @@ def compute_doublet_score(
             'n_features', 
             'weighted_density', 
             'distance_to_real', 
-            'ratio_doublets', 
             'difficulty'
         ]
+        k_vals = np.sort(np.unique([k for k in [3, 10, 15, 20, 25, 50, n_neighbors] if k <= n_neighbors]))
+        feature_cols.extend([f'ratio_doublets_{ki}' for ki in k_vals])
     else:
         feature_cols = training_features
         
@@ -363,8 +339,14 @@ def compute_doublet_score(
         if verbose:
             print(f"Training iteration {i+1}/{n_iters}...")
 
-        iter_df = adata_combined.obs[["type", "src", clusters_col, "include.in.training"]].copy()
-        iter_df = iter_df.rename(columns={clusters_col: "cluster"})
+        cols = ["type", "src", "include.in.training"]
+        if clusters_col:
+            cols.append(clusters_col)
+        iter_df = adata_combined.obs[cols].copy()
+        if clusters_col:
+            iter_df = iter_df.rename(columns={clusters_col: "cluster"})
+        else:
+            iter_df["cluster"] = 1
         iter_df["score"] = scores
 
         # R equivalent: call thresholding with higher stringency (0.7) during training exclusion.
@@ -409,24 +391,9 @@ def compute_doublet_score(
             X_train = X_full[train_idx]
             y_train = y[train_idx]
 
-            if nrounds is None:
-                dtrain = xgb.DMatrix(X_train, label=y_train)
-                cv_res = xgb.cv(
-                    params={
-                        'objective': 'binary:logistic',
-                        'eval_metric': score_metric,
-                        'max_depth': max_depth,
-                        'learning_rate': eta,
-                        'subsample': 0.75,
-                    },
-                    dtrain=dtrain,
-                    num_boost_round=200,
-                    nfold=5,
-                    early_stopping_rounds=2,
-                    seed=random_state,
-                    verbose_eval=False,
-                )
-                n_estimators = max(1, int(cv_res.shape[0]))
+            if nrounds is None or nrounds < 1:
+                nrounds_eff = (1 + np.sum(y_train == 1)) * (0.25 if nrounds is None else float(nrounds))
+                n_estimators = max(1, int(np.ceil(nrounds_eff)))
             else:
                 n_estimators = int(max(1, nrounds))
 
@@ -470,8 +437,14 @@ def compute_doublet_score(
     # 7. Thresholding (optim)
     # -----------------------
     # Keep parity with the R `optim` threshold path used in the current flow.
-    threshold_df = adata_combined.obs[["type", "src", clusters_col, "include.in.training"]].copy()
-    threshold_df = threshold_df.rename(columns={clusters_col: "cluster"})
+    cols = ["type", "src", "include.in.training"]
+    if clusters_col:
+        cols.append(clusters_col)
+    threshold_df = adata_combined.obs[cols].copy()
+    if clusters_col:
+        threshold_df = threshold_df.rename(columns={clusters_col: "cluster"})
+    else:
+        threshold_df["cluster"] = 1
     threshold_df["score"] = scores
     final_threshold, final_calls = doublet_thresholding_optim(
         threshold_df,
@@ -499,14 +472,16 @@ def compute_doublet_score(
         # Actually standard concat appends if keys match.
         pass
         
-    adata.obs['scDblFinder_score'] = final_scores
-    adata.obs['scDblFinder_class'] = pd.Categorical(np.asarray(final_calls)[real_mask])
-    adata.uns['scDblFinder_threshold'] = float(final_threshold)
+    adata_orig.obs['scDblFinder_score'] = final_scores
+    adata_orig.obs['scDblFinder_class'] = pd.Categorical(np.asarray(final_calls)[real_mask])
+    adata_orig.uns['scDblFinder_threshold'] = float(final_threshold)
     
     if return_type == 'full':
-        return adata_combined
+        # Add artificial to orig
+        adata_all = sc.concat([adata_orig, adata_combined[~real_mask].copy()], join='outer')
+        return adata_all
     
-    return adata
+    return adata_orig
 
 
 def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
@@ -549,15 +524,21 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
     # Retrieve types of neighbors
     neighbor_types = y_type[indices] # (n_obs, n_neighbors)
     
-    # Ratio at full k
-    ratio_k = np.mean(neighbor_types, axis=1)
+    # Ratio at multiple k
+    ratio_dict = {}
+    k_vals = np.sort(np.unique([k for k in [3, 10, 15, 20, 25, 50, n_neighbors] if k <= n_neighbors]))
+    for ki in k_vals:
+        ratio_dict[f'ratio_doublets_{ki}'] = np.mean(neighbor_types[:, :ki], axis=1)
     
     # 3. Weighted density
     # R: dw <- sqrt(k - seq_len(k)) * 1/dist
     # Python: weights based on rank/distance
     
     # Check for zero dists
-    SAFE_DIST = np.maximum(distances, 1e-6)
+    SAFE_DIST = distances.copy()
+    first_col = SAFE_DIST[:, 0]
+    min_gt_0 = first_col[first_col > 0].min() if (first_col > 0).any() else 1e-6
+    SAFE_DIST[SAFE_DIST == 0] = min_gt_0
     
     ranks = np.arange(1, n_neighbors + 1)
     rank_weights = np.sqrt(n_neighbors - ranks) # Shape (n_neighbors,)
@@ -685,16 +666,18 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
     # Efficiently find min dist to type 0
     
     real_mask = (neighbor_types == 0)
-    max_dist = distances.max() * 2
+    max_dist = distances[:, 0].max() * 2
     d_real = distances.copy()
     d_real[~real_mask] = max_dist
     dist_to_nearest_real = d_real.min(axis=1)
 
-    return {
+    res = {
         'distance_to_nearest': dist_to_k, # Keep for debug but exclude from features later
-        'ratio_doublets': ratio_k,
         'weighted_density': weighted_score,
         'distance_to_real': dist_to_nearest_real,
         'difficulty': difficulty,
-        'most_likely_origin': most_likely_str
+        'most_likely_origin': most_likely_str,
+        'ratio_doublets': np.mean(neighbor_types[:, :n_neighbors], axis=1)
     }
+    res.update(ratio_dict)
+    return res
