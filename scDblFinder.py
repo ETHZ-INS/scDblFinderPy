@@ -12,6 +12,46 @@ from .doublet_generation import get_artificial_doublets
 from .misc import cxds2, select_features
 from .thresholding import _gdbr, doublet_thresholding_optim
 
+def _filter_unrecognizable_doublets(d, minSize=5, minMedDiff=0.1):
+    src = d['src'].values
+    origin = d['most_likely_origin'].values if 'most_likely_origin' in d else np.full(len(d), np.nan)
+    score = d['score'].values
+    cluster = d['cluster'].values
+    
+    da_mask = (src == 'artificial') & pd.Series(origin).str.contains(r'\+', regex=True, na=False).values
+    dr_mask = (src == 'real')
+    
+    if not np.any(dr_mask):
+        return []
+        
+    dr_med = np.median(score[dr_mask])
+    
+    dr_df = pd.DataFrame({'score': score[dr_mask], 'cluster': cluster[dr_mask]})
+    if dr_df.empty:
+        return []
+    
+    rq = dr_df.groupby('cluster', observed=False)['score'].quantile([0.5, 0.9]).unstack()
+    
+    da_df = pd.DataFrame({'score': score[da_mask], 'origin': origin[da_mask]})
+    da_groups = da_df.groupby('origin', observed=False)
+    
+    drop_origins = []
+    for orig, group in da_groups:
+        if len(group) < minSize:
+            continue
+        z = group['score'].quantile([0.1, 0.5]).values
+        origs = str(orig).split('+')
+        if origs[0] not in rq.index or origs[1] not in rq.index:
+            continue
+            
+        rq_x_2 = [rq.loc[origs[0] , 0.9], rq.loc[origs[1], 0.9]]
+        rq_x_1_max = max(rq.loc[origs[0] , 0.5], rq.loc[origs[1], 0.5])
+        
+        if any(z[0] < v for v in rq_x_2) or (z[1] - max(dr_med, rq_x_1_max)) < minMedDiff:
+            drop_origins.append(orig)
+            
+    return drop_origins
+
 def compute_doublet_score(
     adata, 
     n_neighbors=None,
@@ -23,7 +63,7 @@ def compute_doublet_score(
     samples_col=None, # R: samples=NULL
     use_gpu=False,
     random_state=42,
-    n_iters=3,
+    n_iters=2,
     # R parameter equivalents
     clust_cor=None, # clustCor
     prop_random=0.0, # propRandom
@@ -31,7 +71,7 @@ def compute_doublet_score(
     aggregate_features=False, # aggregateFeatures
     score_metric='logloss', # metric
     nrounds=0.25,
-    max_depth=4,
+    max_depth=5,
     eta=0.3,
     filter_unidentifiable=True,
     unident_th=None,
@@ -130,7 +170,7 @@ def compute_doublet_score(
         n_clusters = 1
 
     if unident_th is None:
-        unident_th = 0.2 if clusters is None else 0.0
+        unident_th = 0.0 if clusters is not None else 0.2
         
     adata_orig = adata
     
@@ -165,7 +205,8 @@ def compute_doublet_score(
         X_counts, 
         n=n_artificial, 
         clusters=clusters,
-        prop_random=prop_random
+        prop_random=prop_random,
+        adjust_size=False
     )
     X_artificial = res['counts']
     origins = res['origins']
@@ -391,24 +432,51 @@ def compute_doublet_score(
             X_train = X_full[train_idx]
             y_train = y[train_idx]
 
+            dtrain = xgb.DMatrix(X_train, label=y_train)
+            params = {
+                'objective': 'binary:logistic',
+                'eval_metric': score_metric,
+                'max_depth': max_depth,
+                'learning_rate': eta,
+                'subsample': 0.75,
+                'tree_method': 'exact',
+                'nthread': -1,
+                'random_state': random_state
+            }
+
             if nrounds is None or nrounds < 1:
-                nrounds_eff = (1 + np.sum(y_train == 1)) * (0.25 if nrounds is None else float(nrounds))
-                n_estimators = max(1, int(np.ceil(nrounds_eff)))
+                cv_results = xgb.cv(
+                    params,
+                    dtrain,
+                    num_boost_round=200,
+                    nfold=5,
+                    early_stopping_rounds=2,
+                    metrics={score_metric},
+                    seed=random_state,
+                    verbose_eval=False
+                )
+                mean_col = f"test-{score_metric}-mean"
+                std_col = f"test-{score_metric}-std"
+                
+                best_idx = cv_results[mean_col].idxmin()
+                
+                if nrounds == 0 or nrounds is None:
+                    n_estimators = int(max(1, best_idx + 1))
+                else:
+                    ac = cv_results.loc[best_idx, mean_col] + float(nrounds) * cv_results.loc[best_idx, std_col]
+                    # R finds the `min(which(mean <= ac))`, meaning the first round that drops below the threshold 'ac'
+                    valid_rounds = cv_results[cv_results[mean_col] <= ac].index
+                    n_estimators = int(max(1, valid_rounds[0] + 1)) if len(valid_rounds) > 0 else int(max(1, best_idx + 1))
             else:
                 n_estimators = int(max(1, nrounds))
 
-            clf = xgb.XGBClassifier(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=eta,
-                objective='binary:logistic',
-                eval_metric=score_metric,
-                subsample=0.75,
-                n_jobs=-1,
-                random_state=random_state,
+            bst = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=n_estimators
             )
-            clf.fit(X_train, y_train)
-            scores = clf.predict_proba(X_full)[:, 1]
+            dfull = xgb.DMatrix(X_full)
+            scores = bst.predict(dfull)
 
         adata_combined.obs['scDblFinder_score'] = scores
 
@@ -433,6 +501,23 @@ def compute_doublet_score(
 
         train_mask = ~excluded
         adata_combined.obs['include.in.training'] = train_mask
+
+        if bool(filter_unidentifiable) and i == n_iters - 1:
+            tmp_d = adata_combined.obs[['src', 'most_likely_origin', 'type']].copy()
+            tmp_d['score'] = scores
+            tmp_d['cluster'] = adata_combined.obs[clusters_col].values if clusters_col else 1
+            drop_origins = _filter_unrecognizable_doublets(tmp_d)
+            if len(drop_origins) > 0:
+                drop_mask = (tmp_d['src'] == 'artificial') & tmp_d['most_likely_origin'].isin(drop_origins).values
+                if np.any(drop_mask):
+                    keep_mask = ~drop_mask
+                    adata_combined = adata_combined[keep_mask].copy()
+                    scores = scores[keep_mask]
+                    train_mask = train_mask[keep_mask]
+                    real_mask_all = real_mask_all[keep_mask]
+                    dbl_mask_all = dbl_mask_all[keep_mask]
+                    X_full = X_full[keep_mask]
+                    y = y[keep_mask]
 
     # 7. Thresholding (optim)
     # -----------------------
