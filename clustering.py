@@ -70,28 +70,31 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
         
     is_log = (max_val < 20) # Heuristic
     
+    # Use a working copy to avoid mutating the original adata.X
+    adata_calc = adata.copy()
+
     if not is_log:
          if verbose: print("Normalizing counts...")
-         sc.pp.normalize_total(adata, target_sum=1e4)
-         sc.pp.log1p(adata)
+         sc.pp.normalize_total(adata_calc, target_sum=1e4)
+         sc.pp.log1p(adata_calc)
     
     # Check for PCA
-    if 'X_pca' not in adata.obsm or adata.obsm['X_pca'].shape[1] < n_components:
+    if 'X_pca' not in adata_calc.obsm or adata_calc.obsm['X_pca'].shape[1] < n_components:
         if verbose: print("Running PCA...")
         if use_gpu:
             # Transfer to GPU if needed (implicitly handled by rsc if installed properly)
             # But usually rsc expects adata.X to be on GPU or handles transfer
             # For simplicity, we assume standard flow or check if rsc.pp logic handles it.
             # rsc.pp.pca handles selection of HVG and PCA computation
-             if 'highly_variable' not in adata.var:
-                 rsc.pp.highly_variable_genes(adata, n_top_genes=n_features)
-             rsc.pp.pca(adata, n_comps=n_components)
+             if 'highly_variable' not in adata_calc.var:
+                 rsc.pp.highly_variable_genes(adata_calc, n_top_genes=n_features)
+             rsc.pp.pca(adata_calc, n_comps=n_components)
         else:
-             if 'highly_variable' not in adata.var:
-                 sc.pp.highly_variable_genes(adata, n_top_genes=n_features)
-             sc.pp.pca(adata, n_comps=n_components)
+             if 'highly_variable' not in adata_calc.var:
+                 sc.pp.highly_variable_genes(adata_calc, n_top_genes=n_features)
+             sc.pp.pca(adata_calc, n_comps=n_components)
              
-    X_pca = adata.obsm['X_pca'][:, :n_components]
+    X_pca = adata_calc.obsm['X_pca'][:, :n_components]
     
     # Ensure X_pca is on CPU for K-means fallback or just generic compatibility if needed
     # However, cuml KMeans expects GPU data usually.
@@ -183,11 +186,13 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
         n_neighbors = min(max(2, int(np.sqrt(n_cells)) - 1), 10)
         
         if use_gpu:
-             rsc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep='X_pca')
-             rsc.tl.leiden(adata, key_added=key_added)
+             rsc.pp.neighbors(adata_calc, n_neighbors=n_neighbors, use_rep='X_pca')
+             rsc.tl.leiden(adata_calc, key_added=key_added)
         else:
-             sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep='X_pca')
-             sc.tl.leiden(adata, key_added=key_added)
+             sc.pp.neighbors(adata_calc, n_neighbors=n_neighbors, use_rep='X_pca')
+             sc.tl.leiden(adata_calc, key_added=key_added)
+             
+        adata.obs[key_added] = adata_calc.obs[key_added].values
             
     if verbose:
         n_found = len(adata.obs[key_added].unique())
