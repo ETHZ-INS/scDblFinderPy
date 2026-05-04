@@ -6,6 +6,21 @@ from anndata import AnnData
 import warnings
 from sklearn.cluster import KMeans
 
+
+def _top_variance_gene_indices(X, n_top):
+    if sp.issparse(X):
+        X = X.tocsr()
+        means = np.asarray(X.mean(axis=0)).ravel()
+        mean_squares = np.asarray(X.multiply(X).mean(axis=0)).ravel()
+        variances = mean_squares - means ** 2
+    else:
+        variances = np.var(X, axis=0)
+
+    variances = np.asarray(variances).ravel()
+    if n_top >= variances.size:
+        return np.arange(variances.size)
+    return np.argsort(variances)[::-1][:n_top]
+
 def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000, 
                  key_added='clusters', use_gpu=False, random_state=0, verbose=True):
     """
@@ -28,7 +43,7 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
     n_components : int, optional
         Number of PCA components to use.
     n_features : int, optional
-        Number of highly variable genes to use for PCA if not already present.
+        Number of highest-variance genes to use for PCA if not already present.
     key_added : str, optional
         Key under which to add the cluster labels in `adata.obs`.
     use_gpu : bool, optional
@@ -80,19 +95,18 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
     
     # Check for PCA
     if 'X_pca' not in adata_calc.obsm or adata_calc.obsm['X_pca'].shape[1] < n_components:
+        if verbose: print("Selecting top variance genes for PCA...")
+        top_gene_idx = _top_variance_gene_indices(adata_calc.X, min(n_features, adata_calc.n_vars))
+        adata_calc = adata_calc[:, top_gene_idx].copy()
+
         if verbose: print("Running PCA...")
         if use_gpu:
             # Transfer to GPU if needed (implicitly handled by rsc if installed properly)
             # But usually rsc expects adata.X to be on GPU or handles transfer
             # For simplicity, we assume standard flow or check if rsc.pp logic handles it.
-            # rsc.pp.pca handles selection of HVG and PCA computation
-             if 'highly_variable' not in adata_calc.var:
-                 rsc.pp.highly_variable_genes(adata_calc, n_top_genes=n_features)
-             rsc.pp.pca(adata_calc, n_comps=n_components)
+            rsc.pp.pca(adata_calc, n_comps=n_components)
         else:
-             if 'highly_variable' not in adata_calc.var:
-                 sc.pp.highly_variable_genes(adata_calc, n_top_genes=n_features)
-             sc.pp.pca(adata_calc, n_comps=n_components)
+            sc.pp.pca(adata_calc, n_comps=n_components)
              
     X_pca = adata_calc.obsm['X_pca'][:, :n_components]
     
