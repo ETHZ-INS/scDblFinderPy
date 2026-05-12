@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import random
 from anndata import AnnData
 import scipy.sparse as sp
 from sklearn.neighbors import NearestNeighbors
@@ -63,15 +64,17 @@ def compute_doublet_score(
     samples_col=None, # R: samples=NULL
     use_gpu=False,
     random_state=42,
-    n_iters=2,
+    n_iters=3,
     # R parameter equivalents
     clust_cor=None, # clustCor
-    prop_random=0.0, # propRandom
+    prop_random=0.1, # propRandom
+    adjust_size=0.25,
+    meta_triplets=True,
     prop_markers=0.0, # propMarkers
     aggregate_features=False, # aggregateFeatures
     score_metric='logloss', # metric
     nrounds=0.25,
-    max_depth=5,
+    max_depth=4,
     eta=0.3,
     filter_unidentifiable=True,
     unident_th=None,
@@ -137,6 +140,9 @@ def compute_doublet_score(
     if samples_col is not None:
         warnings.warn("multi_sample_mode has been removed; samples_col is ignored.")
 
+    np.random.seed(random_state)
+    random.seed(random_state)
+
     # 1. Preprocessing & Clustering
     # -----------------------------
     # Ensure counts layer or X is counts
@@ -201,18 +207,30 @@ def compute_doublet_score(
     X_counts = adata.layers['counts'] if 'counts' in adata.layers else adata.X
     
     # This returns a dictionary {"counts": ..., "origins": ...}
+    rng = np.random.default_rng(random_state)
+
     res = get_artificial_doublets(
         X_counts, 
         n=n_artificial, 
         clusters=clusters,
         prop_random=prop_random,
-        adjust_size=False
+        adjust_size=adjust_size,
+        meta_triplets=meta_triplets,
+        random_state=random_state,
+        rng=rng
     )
     X_artificial = res['counts']
     origins = res['origins']
     
     # Create AnnData for artificial
     adata_art = AnnData(X=X_artificial)
+    # Name artificial cells
+    art_names = [f"art.{i}" for i in range(1, len(origins) + 1)]
+    try:
+        adata_art.obs_names = art_names
+    except Exception:
+        # fallback: set a column instead
+        adata_art.obs['__art_name'] = art_names
     adata_art.obs['type'] = 'artificial'
     adata_art.obs['src'] = 'artificial'
     adata_art.obs['most_likely_origin'] = origins
@@ -223,7 +241,11 @@ def compute_doublet_score(
     adata_real = AnnData(X=X_real_counts.copy(), obs=adata.obs.copy(), var=adata.var.copy())
     adata_real.obs['type'] = 'real'
     adata_real.obs['src'] = 'real'
-    adata_real.obs['most_likely_origin'] = np.nan # Initially unknown check if string or nan
+    adata_real.obs['most_likely_origin'] = np.nan # Initially unknown
+    # Preserve original obs names to ensure correct mapping after concat
+    adata_real.obs['_orig_index'] = adata_real.obs_names.astype(str)
+    # Mark artificial originals as NaN so we can distinguish
+    adata_art.obs['_orig_index'] = [np.nan] * adata_art.n_obs
     
     # Concatenate
     # We only care about matching genes.
@@ -233,10 +255,10 @@ def compute_doublet_score(
     # Use concat instead of deprecated concatenate
     # Note: index_unique='-' appends keys to index to ensure uniqueness
     adata_combined = sc.concat(
-        [adata_real, adata_art], 
-        join='outer', 
-        label='batch_source', 
-        keys=['real', 'artificial'], 
+        [adata_real, adata_art],
+        join='outer',
+        label='batch_source',
+        keys=['real', 'artificial'],
         index_unique='-'
     )
 
@@ -281,24 +303,22 @@ def compute_doublet_score(
     
     sc.pp.normalize_total(adata_combined, target_sum=1e4)
     sc.pp.log1p(adata_combined)
-    sc.pp.pca(adata_combined, n_comps=n_components)
+    sc.pp.pca(adata_combined, n_comps=n_components, random_state=random_state)
     
     # 5. KNN & Doublet Features
     # -------------------------
     if verbose: print("Evaluating KNN features...")
     
     if n_neighbors is None:
-         # R heuristic? default k is often based on dataset size
-        n_neighbors = int(np.round(0.01 * n_cells))
-        n_neighbors = max(20, min(100, n_neighbors))
+        # Align with R's defaultKnnKs kmax heuristic.
+        n_neighbors = max(int(np.ceil(np.sqrt(n_cells / 2.0))), 25)
         
     knn_features = _evaluate_knn(adata_combined, n_neighbors=n_neighbors, use_gpu=use_gpu)
     
     # Add features to obs
     for col, values in knn_features.items():
         adata_combined.obs[col] = values
-        
-    # 6. Classifier Training
+        # 6. Classifier Training
     # ----------------------
     # We want to distinguish 'real' vs 'artificial'?
     # Actually, we assume 'real' are mix of singlets and doublets.
@@ -440,8 +460,9 @@ def compute_doublet_score(
                 'learning_rate': eta,
                 'subsample': 0.75,
                 'tree_method': 'exact',
-                'nthread': -1,
-                'random_state': random_state
+                'nthread': 1,
+                'seed': random_state,
+                'seed_per_iteration': True,
             }
 
             if nrounds is None or nrounds < 1:
@@ -546,19 +567,20 @@ def compute_doublet_score(
     
     real_mask = adata_combined.obs['type'] == 'real'
     final_scores = scores[real_mask]
-    
-    # Store in original adata
-    # Assuming order preserved? 
-    # adata_real was first part of concat.
-    # Check simple length match
-    if len(final_scores) != n_cells:
-        # Fallback to index matching
-        # adata.obs_names should be in adata_combined.obs_names (maybe with suffixes)
-        # Actually standard concat appends if keys match.
-        pass
-        
-    adata_orig.obs['scDblFinder_score'] = final_scores
-    adata_orig.obs['scDblFinder_class'] = pd.Categorical(np.asarray(final_calls)[real_mask])
+
+    # Map final scores back to original AnnData using preserved _orig_index
+    orig_indices = adata_combined.obs.loc[real_mask, '_orig_index'].astype(str).values
+    # Build series indexed by original obs names
+    ser_scores = pd.Series(final_scores, index=orig_indices)
+    # Reindex to the original adata ordering (will insert NaN if mismatch)
+    adata_orig.obs['scDblFinder_score'] = ser_scores.reindex(adata_orig.obs_names).values
+
+    # Map classes similarly
+    final_calls_all = np.asarray(final_calls)
+    final_calls_real = final_calls_all[real_mask]
+    ser_calls = pd.Series(final_calls_real, index=orig_indices)
+    adata_orig.obs['scDblFinder_class'] = pd.Categorical(ser_calls.reindex(adata_orig.obs_names).values)
+
     adata_orig.uns['scDblFinder_threshold'] = float(final_threshold)
     
     if return_type == 'full':

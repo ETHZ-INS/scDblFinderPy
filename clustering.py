@@ -2,9 +2,28 @@ import numpy as np
 import scipy.sparse as sp
 import pandas as pd
 import scanpy as sc
+import igraph as ig
 from anndata import AnnData
 import warnings
 from sklearn.cluster import KMeans
+
+
+class _IGraphRNG:
+    """Wrapper to provide igraph-compatible RNG interface to numpy's RandomState."""
+    def __init__(self, seed):
+        self.rng = np.random.RandomState(seed)
+    
+    def random(self):
+        """Return random float in [0, 1)."""
+        return self.rng.rand()
+    
+    def randint(self, a, b):
+        """Return random integer in [a, b)."""
+        return self.rng.randint(a, b)
+    
+    def gauss(self, mu, sigma):
+        """Return Gaussian random variate."""
+        return self.rng.normal(mu, sigma)
 
 
 def _top_variance_gene_indices(X, n_top):
@@ -21,16 +40,43 @@ def _top_variance_gene_indices(X, n_top):
         return np.arange(variances.size)
     return np.argsort(variances)[::-1][:n_top]
 
+
+def _louvain_labels(connectivities, random_state=0):
+    if sp.issparse(connectivities):
+        coo = connectivities.tocoo()
+        edge_mask = coo.row < coo.col
+        rows = coo.row[edge_mask]
+        cols = coo.col[edge_mask]
+        weights = coo.data[edge_mask].astype(float)
+    else:
+        upper = np.triu(connectivities, k=1)
+        rows, cols = np.where(upper > 0)
+        weights = upper[rows, cols].astype(float)
+
+    n_vertices = connectivities.shape[0]
+    if rows.size == 0:
+        return np.arange(n_vertices, dtype=int)
+
+    # Set seed for reproducibility - both numpy and igraph
+    # Create an RNG wrapper that provides igraph's required interface
+    rng = _IGraphRNG(random_state)
+    ig.set_random_number_generator(rng)
+    
+    graph = ig.Graph(n=n_vertices, edges=list(zip(rows.tolist(), cols.tolist())))
+    graph.es['weight'] = weights.tolist()
+    membership = graph.community_multilevel(weights='weight').membership
+    return np.asarray(membership, dtype=int)
+
 def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000, 
                  key_added='clusters', use_gpu=False, random_state=0, verbose=True):
     """
-    Performs fast two-step clustering: K-means then Leiden on centroids.
-    
+    Performs fast two-step clustering: K-means then graph clustering on centroids.
+
     This function mimics the logic of `fastcluster` in scDblFinder (R package).
     1. Runs K-means with a large k (e.g. 2500) on PCA components.
     2. Aggregates cells into centroids based on K-means clusters.
     3. Builds a KNN graph on these centroids.
-    4. Runs Leiden clustering on the graph (replaces Louvain for better stability).
+    4. Runs graph clustering on the centroid graph.
     5. Propagates the labels back to original cells.
     
     Parameters
@@ -61,8 +107,8 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
     
     if use_gpu:
         try:
-            import rapids_singlecell as rsc
-            import cuml
+            import rapids_singlecell as rsc  # type: ignore[import-not-found]
+            import cuml  # type: ignore[import-not-found]
         except ImportError:
             warnings.warn("rapids-singlecell or cuml not found. Falling back to CPU.")
             use_gpu = False
@@ -104,9 +150,9 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
             # Transfer to GPU if needed (implicitly handled by rsc if installed properly)
             # But usually rsc expects adata.X to be on GPU or handles transfer
             # For simplicity, we assume standard flow or check if rsc.pp logic handles it.
-            rsc.pp.pca(adata_calc, n_comps=n_components)
+            rsc.pp.pca(adata_calc, n_comps=n_components, random_state=random_state)
         else:
-            sc.pp.pca(adata_calc, n_comps=n_components)
+            sc.pp.pca(adata_calc, n_comps=n_components, random_state=random_state)
              
     X_pca = adata_calc.obsm['X_pca'][:, :n_components]
     
@@ -173,18 +219,13 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
         
         if use_gpu:
             rsc.pp.neighbors(adata_centroids, n_neighbors=n_neighbors, n_pcs=n_components, use_rep='X')
-            rsc.tl.leiden(adata_centroids)
-            centroid_clusters = adata_centroids.obs['leiden'].values
         else:
             sc.pp.neighbors(adata_centroids, n_neighbors=n_neighbors, n_pcs=n_components, use_rep='X')
-            sc.tl.leiden(adata_centroids)
-            centroid_clusters = adata_centroids.obs['leiden'].values
+
+        centroid_clusters = _louvain_labels(adata_centroids.obsp['connectivities'], random_state=random_state)
             
         # 4. Map back to cells
-        # Create a mapping dictionary: kmeans_label -> leiden_label
-        # Note: 'leiden' column is usually string/categorical
-        
-        # Make sure mapping aligns with unique_labels
+        # Create a mapping dictionary: kmeans_label -> louvain_label
         # If groupby sorts by label (default is True), centroids are ordered by unique_labels
         
         map_dict = dict(zip(unique_labels, centroid_clusters))
@@ -192,7 +233,7 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
         # Use kmeans_labels_cpu for mapping (safe for both CPU/GPU paths)
         final_clusters = np.array([map_dict[l] for l in kmeans_labels_cpu])
         
-        adata.obs[key_added] = pd.Categorical(final_clusters)
+        adata.obs[key_added] = pd.Categorical(final_clusters.astype(str))
         
     else:
         # Fallback for small datasets: direct graph clustering
@@ -200,14 +241,13 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
         n_neighbors = min(max(2, int(np.sqrt(n_cells)) - 1), 10)
         
         if use_gpu:
-             rsc.pp.neighbors(adata_calc, n_neighbors=n_neighbors, use_rep='X_pca')
-             rsc.tl.leiden(adata_calc, key_added=key_added)
+            rsc.pp.neighbors(adata_calc, n_neighbors=n_neighbors, use_rep='X_pca')
         else:
-             sc.pp.neighbors(adata_calc, n_neighbors=n_neighbors, use_rep='X_pca')
-             sc.tl.leiden(adata_calc, key_added=key_added)
-             
-        adata.obs[key_added] = adata_calc.obs[key_added].values
-            
+            sc.pp.neighbors(adata_calc, n_neighbors=n_neighbors, use_rep='X_pca')
+
+        direct_clusters = _louvain_labels(adata_calc.obsp['connectivities'], random_state=random_state)
+        adata.obs[key_added] = pd.Categorical(direct_clusters.astype(str))
+
     if verbose:
         n_found = len(adata.obs[key_added].unique())
         print(f"Fast clustering found {n_found} clusters.")
