@@ -72,16 +72,19 @@ def cxds2(adata, which_dbls=None, ntop=500, bin_thresh=None, verbose=False, n_to
             else:
                 p_nonzero_vec = np.sum(x > 0, axis=1) / n_cells
 
+            # R computes the quantile cutoff from the full pre-filter mean(pNonZero)
+            # and only then subsets to the top ntop genes. Keep that exact order.
+            p_nonzero_mean = float(np.mean(p_nonzero_vec))
+
             # Match R's stable `order()` tie-breaking: preserve original gene order on ties.
             order = np.lexsort((np.arange(p_nonzero_vec.shape[0]), p_nonzero_vec))
             keep = order[:ntop]
             x = x[keep, :]
-            p_nonzero_vec = p_nonzero_vec[keep]
 
             if sp.issparse(x):
                 vals = x.data
                 if vals.size > 0:
-                    bin_thresh = max(1, float(np.quantile(vals, np.mean(p_nonzero_vec) * 0.5)))
+                    bin_thresh = max(1, float(np.quantile(vals, p_nonzero_mean * 0.5)))
                 else:
                     bin_thresh = 1
             else:
@@ -277,4 +280,4 @@ def select_features(adata, clusters=None, n_features=1000, prop_markers=0.0, fdr
         return [var_names[i] for i in g_idx_fallback]
 
     return g_names[:n_features]
-    
+   

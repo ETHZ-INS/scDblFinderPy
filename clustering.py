@@ -2,28 +2,49 @@ import numpy as np
 import scipy.sparse as sp
 import pandas as pd
 import scanpy as sc
-import igraph as ig
 from anndata import AnnData
+from .graph import make_knn_graph_bluster
 import warnings
 from sklearn.cluster import KMeans
+from .hw_kmeans import hw_kmeans
+from .rng import coerce_rng
+from .louvain_controlled import controlled_louvain_labels
 
 
-class _IGraphRNG:
-    """Wrapper to provide igraph-compatible RNG interface to numpy's RandomState."""
-    def __init__(self, seed):
-        self.rng = np.random.RandomState(seed)
-    
-    def random(self):
-        """Return random float in [0, 1)."""
-        return self.rng.rand()
-    
-    def randint(self, a, b):
-        """Return random integer in [a, b)."""
-        return self.rng.randint(a, b)
-    
-    def gauss(self, mu, sigma):
-        """Return Gaussian random variate."""
-        return self.rng.normal(mu, sigma)
+def _r_style_kmeans(X, n_clusters, n_start=3, max_iter=50, random_state=0, trace=None):
+    """Run k-means using R-like random initialization: sample rows as centers.
+
+    We perform `n_start` restarts by sampling `n_clusters` distinct rows
+    from `X` as initial centers (using CentralRNG) and keep the run with
+    lowest inertia. This more closely matches R's `stats::kmeans` init.
+    """
+    rng = coerce_rng(random_state=random_state, rng=random_state)
+    best_inertia = None
+    best_labels = None
+    best_centers = None
+
+    X_arr = np.asarray(X)
+    n_samples = X_arr.shape[0]
+
+    for i in range(max(1, int(n_start))):
+        # Sample distinct row indices for initial centers using R-style sample.int
+        # `sample_int` returns 1-based indices, so convert to 0-based.
+        init_idx = (rng.sample_int(n_samples, n_clusters, replace=False) - 1).astype(int)
+        init_centers = X_arr[init_idx]
+
+        # Use Hartigan-Wong style k-means implemented in hw_kmeans
+        # Pass the sampled init indices so the initialization matches R's
+        labels_hw, centers_hw = hw_kmeans(
+            X_arr, n_clusters=n_clusters, n_start=1, max_iter=max_iter, rng=rng, init_idx=init_idx, trace=trace
+        )
+        # compute inertia
+        inertia = np.sum((X_arr - centers_hw[labels_hw])**2)
+        if best_inertia is None or inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels_hw.copy()
+            best_centers = centers_hw.copy()
+
+    return best_labels, best_centers
 
 
 def _top_variance_gene_indices(X, n_top):
@@ -42,33 +63,10 @@ def _top_variance_gene_indices(X, n_top):
 
 
 def _louvain_labels(connectivities, random_state=0):
-    if sp.issparse(connectivities):
-        coo = connectivities.tocoo()
-        edge_mask = coo.row < coo.col
-        rows = coo.row[edge_mask]
-        cols = coo.col[edge_mask]
-        weights = coo.data[edge_mask].astype(float)
-    else:
-        upper = np.triu(connectivities, k=1)
-        rows, cols = np.where(upper > 0)
-        weights = upper[rows, cols].astype(float)
-
-    n_vertices = connectivities.shape[0]
-    if rows.size == 0:
-        return np.arange(n_vertices, dtype=int)
-
-    # Set seed for reproducibility - both numpy and igraph
-    # Create an RNG wrapper that provides igraph's required interface
-    rng = _IGraphRNG(random_state)
-    ig.set_random_number_generator(rng)
-    
-    graph = ig.Graph(n=n_vertices, edges=list(zip(rows.tolist(), cols.tolist())))
-    graph.es['weight'] = weights.tolist()
-    membership = graph.community_multilevel(weights='weight').membership
-    return np.asarray(membership, dtype=int)
+    return controlled_louvain_labels(connectivities, random_state=random_state)
 
 def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000, 
-                 key_added='clusters', use_gpu=False, random_state=0, verbose=True):
+                 key_added='clusters', use_gpu=False, random_state=0, rng=None, verbose=True, kmeans_trace=None):
     """
     Performs fast two-step clustering: K-means then graph clustering on centroids.
 
@@ -98,6 +96,10 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
         Random seed.
     verbose : bool, optional
         Whether to print progress.
+    kmeans_trace : list | callable | None, optional
+        Optional trace sink forwarded to the CPU k-means step. When supplied,
+        it receives dataset-agnostic event dicts describing start order, moves,
+        and reseeding, which can be compared across datasets.
         
     Returns
     -------
@@ -114,30 +116,29 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
             use_gpu = False
 
     n_cells = adata.n_obs
+    # Prefer a provided CentralRNG instance; coerce integers or None as needed
+    rng = coerce_rng(random_state=random_state, rng=rng)
     
     # Handle missing X
     if adata.X is None and 'counts' in adata.layers:
         adata.X = adata.layers['counts'].copy()
         
-    # Preprocessing to avoid issues with raw counts in PCA
-    # scDblFinder R does logNormCounts before PCA
-    # We should do the same here if not normalized
-    # Check max value -> if large integer, probably counts
+    # R-style preprocessing: library-size normalize, then log-transform before PCA.
+    # This mirrors scuttle::normalizeCounts followed by scater::runPCA more closely
+    # than scanpy's default normalize_total/log1p path.
     if verbose: print("Checking normalization...")
-    if sp.issparse(adata.X):
-        max_val = adata.X.data.max() if adata.X.nnz > 0 else 0
-    else:
-        max_val = adata.X.max()
-        
-    is_log = (max_val < 20) # Heuristic
-    
-    # Use a working copy to avoid mutating the original adata.X
     adata_calc = adata.copy()
+    if sp.issparse(adata_calc.X):
+        counts = adata_calc.X.toarray().astype(float)
+    else:
+        counts = np.asarray(adata_calc.X, dtype=float)
 
-    if not is_log:
-         if verbose: print("Normalizing counts...")
-         sc.pp.normalize_total(adata_calc, target_sum=1e4)
-         sc.pp.log1p(adata_calc)
+    lib_sizes = counts.sum(axis=1)
+    mean_lib = lib_sizes.mean() if lib_sizes.size > 0 else 1.0
+    size_factors = lib_sizes / mean_lib
+    size_factors[size_factors == 0] = 1.0
+    counts = np.log2(counts / size_factors[:, None] + 1.0)
+    adata_calc.X = counts
     
     # Check for PCA
     if 'X_pca' not in adata_calc.obsm or adata_calc.obsm['X_pca'].shape[1] < n_components:
@@ -147,12 +148,11 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
 
         if verbose: print("Running PCA...")
         if use_gpu:
-            # Transfer to GPU if needed (implicitly handled by rsc if installed properly)
-            # But usually rsc expects adata.X to be on GPU or handles transfer
-            # For simplicity, we assume standard flow or check if rsc.pp logic handles it.
-            rsc.pp.pca(adata_calc, n_comps=n_components, random_state=random_state)
+            rsc.pp.pca(adata_calc, n_comps=n_components, random_state=int(rng.randint32()))
         else:
-            sc.pp.pca(adata_calc, n_comps=n_components, random_state=random_state)
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=min(n_components, min(adata_calc.X.shape)), svd_solver="full")
+            adata_calc.obsm["X_pca"] = pca.fit_transform(adata_calc.X)
              
     X_pca = adata_calc.obsm['X_pca'][:, :n_components]
     
@@ -195,8 +195,12 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
             else:
                 X_pca_cpu = X_pca
         else:
-            kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=3)
-            kmeans_labels = kmeans.fit_predict(X_pca)
+            # Use R-style initialization: sample rows as initial centers and
+            # pick the best of several starts. This makes the initialization
+            # and randomness come from CentralRNG and better matches R.
+            kmeans_labels, kmeans_centers = _r_style_kmeans(
+                X_pca, n_clusters=k, n_start=10, max_iter=100, random_state=rng, trace=kmeans_trace
+            )
             kmeans_labels_cpu = kmeans_labels
             X_pca_cpu = X_pca
             
@@ -207,22 +211,12 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
         centroids = df_pca.groupby('label').mean().values
         unique_labels = np.sort(np.unique(kmeans_labels_cpu))
         
-        # 3. Build KNN on centroids
-        if verbose: print("Building KNN graph on centroids...")
-        
-        # We need an AnnData object for Scanpy/RSC graph functions
-        adata_centroids = AnnData(X=centroids)
-        
-        # R: k = min(max(2, floor(sqrt(n_centroids))-1), 10)
+        # 3. Build KNN/SNN graph on centroids using bluster-like procedure
+        if verbose: print("Building KNN/SNN graph on centroids...")
         n_centroids = centroids.shape[0]
         n_neighbors = min(max(2, int(np.sqrt(n_centroids)) - 1), 10)
-        
-        if use_gpu:
-            rsc.pp.neighbors(adata_centroids, n_neighbors=n_neighbors, n_pcs=n_components, use_rep='X')
-        else:
-            sc.pp.neighbors(adata_centroids, n_neighbors=n_neighbors, n_pcs=n_components, use_rep='X')
-
-        centroid_clusters = _louvain_labels(adata_centroids.obsp['connectivities'], random_state=random_state)
+        conn = make_knn_graph_bluster(centroids, k=n_neighbors, metric='euclidean', mode='knn')
+        centroid_clusters = _louvain_labels(conn, random_state=rng)
             
         # 4. Map back to cells
         # Create a mapping dictionary: kmeans_label -> louvain_label
@@ -245,9 +239,10 @@ def fast_cluster(adata, n_clusters=None, n_components=30, n_features=1000,
         else:
             sc.pp.neighbors(adata_calc, n_neighbors=n_neighbors, use_rep='X_pca')
 
-        direct_clusters = _louvain_labels(adata_calc.obsp['connectivities'], random_state=random_state)
+        direct_clusters = _louvain_labels(adata_calc.obsp['connectivities'], random_state=rng)
         adata.obs[key_added] = pd.Categorical(direct_clusters.astype(str))
 
     if verbose:
         n_found = len(adata.obs[key_added].unique())
         print(f"Fast clustering found {n_found} clusters.")
+          

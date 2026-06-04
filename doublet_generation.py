@@ -5,14 +5,46 @@ import pandas as pd
 from anndata import AnnData
 import scanpy as sc
 import itertools
+import random
+from .r_sample_emulation import sample_int_r
+from .rng import coerce_rng, CentralRNG
 
 
 def _coerce_rng(random_state=None, rng=None):
-    if rng is not None:
-        return rng
-    return np.random.default_rng(random_state)
+    # Return a CentralRNG instance coerced from inputs.
+    return coerce_rng(random_state=random_state, rng=rng)
 
-def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust_size=False, random_state=0, rng=None):
+
+def _python_random_from_rng(rng):
+    # Accept CentralRNG, numpy Generator, or RandomState
+    if hasattr(rng, "integers"):
+        seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+    elif hasattr(rng, 'randint32'):
+        seed = int(rng.randint32())
+    else:
+        seed = int(getattr(rng, 'randint', lambda a, b: 0)(0, 2**32 - 1))
+    return random.Random(seed)
+
+
+def _sample_python(values, size, rng, replace=False):
+    values = np.asarray(values)
+    if size <= 0 or values.size == 0:
+        return np.array([], dtype=values.dtype)
+    # Use CentralRNG or derive a RandomState for Python's sampling if needed
+    if isinstance(rng, CentralRNG) or hasattr(rng, 'randint32'):
+        sample_rng = rng
+    elif hasattr(rng, 'integers'):
+        # derive deterministic RandomState from provided Generator
+        sample_rng = np.random.RandomState(int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32)))
+    else:
+        sample_rng = np.random.RandomState(int(rng))
+
+    idx = sample_int_r(len(values), size, replace=replace, rng=sample_rng) - 1
+    if replace:
+        return values[idx]
+    return values[idx]
+
+def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust_size=False, random_state=0, rng=None, debug_outdir=None):
     """
     Creates artificial doublet cells by combining given pairs of cells.
     
@@ -42,6 +74,7 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
     """
 
     rng = _coerce_rng(random_state=random_state, rng=rng)
+    sample_rng = rng
     
     def check_prop_arg(arg):
         if isinstance(arg, bool):
@@ -67,12 +100,23 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
     n_adjust = int(round(adjust_size_val * n_doublets))
     
     if n_adjust > 0:
-            w_ad = rng.choice(n_doublets, size=n_adjust, replace=False)
+        w_ad = sample_int_r(n_doublets, n_adjust, replace=False, rng=sample_rng) - 1
     else:
-         w_ad = np.array([], dtype=int)
+        w_ad = np.array([], dtype=int)
          
     idx1 = dbl_idx[:, 0]
     idx2 = dbl_idx[:, 1]
+
+    # Debug: dump incoming pair indices
+    if debug_outdir is not None:
+        try:
+            import os
+            os.makedirs(debug_outdir, exist_ok=True)
+            import pandas as pd
+            df_in = pd.DataFrame({'idx1': idx1, 'idx2': idx2})
+            df_in.to_csv(os.path.join(debug_outdir, 'create_doublets_incoming_pairs.csv'), index=False)
+        except Exception:
+            pass
     
     # Basic summation (Cell A + Cell B)
     X_dbl = X[idx1] + X[idx2]
@@ -156,7 +200,7 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
     if half_size_val > 0:
         n_half = int(np.ceil(half_size_val * n_doublets))
         if n_half > 0:
-            w_half = rng.choice(n_doublets, size=n_half, replace=False)
+            w_half = sample_int_r(n_doublets, n_half, replace=False, rng=sample_rng) - 1
             coeffs = np.ones(n_doublets)
             coeffs[w_half] = 0.5
             scaler = sp.diags(coeffs)
@@ -172,9 +216,9 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
         else:
              n_resamp = int(np.ceil(resamp_val * n_doublets))
              if n_resamp > 0:
-                     w_resamp = rng.choice(n_doublets, size=n_resamp, replace=False)
+                 w_resamp = sample_int_r(n_doublets, n_resamp, replace=False, rng=sample_rng) - 1
              else:
-                w_resamp = np.array([], dtype=int)
+                 w_resamp = np.array([], dtype=int)
         
         if len(w_resamp) > 0:
             sub_X = X_dbl[w_resamp].toarray()
@@ -189,7 +233,27 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
              X_dbl.data = np.round(X_dbl.data)
         else:
              X_dbl = X_dbl.round()
-        
+    
+    # Debug: dump resulting doublet indices shape
+    if debug_outdir is not None:
+        try:
+            import os
+            os.makedirs(debug_outdir, exist_ok=True)
+            with open(os.path.join(debug_outdir, 'create_doublets_result_shape.txt'), 'w') as f:
+                f.write(f"n_doublets={X_dbl.shape[0]}, n_genes={X_dbl.shape[1]}\n")
+        except Exception:
+            pass
+    # Ensure integer counts and CSR format to match R's integer matrix behavior
+    if sp.issparse(X_dbl):
+        # Round any non-integer entries and cast to integer type
+        try:
+            X_dbl.data = np.rint(X_dbl.data).astype(np.int64)
+        except Exception:
+            X_dbl = sp.csr_matrix(np.rint(X_dbl.toarray()).astype(np.int64))
+        X_dbl = X_dbl.tocsr()
+    else:
+        X_dbl = sp.csr_matrix(np.rint(np.asarray(X_dbl)).astype(np.int64))
+
     return X_dbl
 
 def get_expected_doublets(clusters, dbr=None, only_heterotypic=True, dbr_per_1k=0.008):
@@ -235,11 +299,12 @@ def get_expected_doublets(clusters, dbr=None, only_heterotypic=True, dbr_per_1k=
                
     return res
 
-def get_cell_pairs(clusters, n=1000, ls=None, q=(0.1, 0.9), sel_mode="proportional", soft_min=5, random_state=0, rng=None):
+def get_cell_pairs(clusters, n=1000, ls=None, q=(0.1, 0.9), sel_mode="proportional", soft_min=5, random_state=0, rng=None, debug_outdir=None, use_sample_int=True):
     """
     Given a vector of cluster labels, returns pairs of cross-cluster cell indices.
     """
     rng = _coerce_rng(random_state=random_state, rng=rng)
+    sample_rng = rng
     clusters = np.asarray(clusters)
     n_cells = len(clusters)
     indices = np.arange(n_cells)
@@ -276,36 +341,40 @@ def get_cell_pairs(clusters, n=1000, ls=None, q=(0.1, 0.9), sel_mode="proportion
         count_per_pair = int(np.ceil(n / len(cluster_pairs)))
         for pair in cluster_pairs:
             pair_counts[pair] = count_per_pair
-            
-    else: # "proportional" or "sqrt"
+    else:
+        # Follow R's exact scaling logic:
+        # 1) ed <- getExpectedDoublets(...)
+        # 2) ed <- ed * n / sum(ed)
+        # 3) if selMode=="sqrt": ed <- sqrt(ed)
+        # 4) ed <- soft_min + ed
+        # 5) final <- ceiling(ed * n / sum(ed))
         ed_dict = get_expected_doublets(clusters, only_heterotypic=True)
-        
-        # Normalize expectations to target n
-        total_ed = sum(ed_dict.values())
-        if total_ed == 0: total_ed = 1
-        scaling_factor = n / total_ed
-        
-        for pair in cluster_pairs:
-            key = f"{pair[0]}+{pair[1]}"
-            expected = ed_dict.get(key, 0)
-            
-            val = expected * scaling_factor
-            if sel_mode == "sqrt":
-                # Rough approximation of sqrt strategy
-                val = np.sqrt(val) 
-                
-            val = soft_min + val
-            pair_counts[pair] = val
+        ed_keys = [f"{p[0]}+{p[1]}" for p in cluster_pairs]
+        ed_vals = np.array([ed_dict.get(k, 0.0) for k in ed_keys], dtype=float)
+        total_ed = ed_vals.sum()
+        if total_ed == 0:
+            ed_scaled = np.full_like(ed_vals, 1.0)
+        else:
+            ed_scaled = ed_vals * (n / total_ed)
 
-        # Re-normalize if we did adjustments
-        current_total = sum(pair_counts.values())
-        if current_total==0: current_total=1
-        for pair in pair_counts:
-            pair_counts[pair] = int(np.ceil(pair_counts[pair] * n / current_total))
+        if sel_mode == "sqrt":
+            ed_scaled = np.sqrt(ed_scaled)
+
+        ed_scaled = soft_min + ed_scaled
+
+        # final normalization and ceiling as in R
+        denom = ed_scaled.sum()
+        if denom == 0:
+            final_counts = np.ceil(ed_scaled)
+        else:
+            final_counts = np.ceil(ed_scaled * (n / denom)).astype(int)
+
+        for pair, cnt in zip(cluster_pairs, final_counts):
+            pair_counts[pair] = int(cnt)
 
     all_pairs = []
     all_origins = []
-    
+
     for pair in cluster_pairs:
         count = pair_counts[pair]
         if count <= 0: continue
@@ -318,8 +387,14 @@ def get_cell_pairs(clusters, n=1000, ls=None, q=(0.1, 0.9), sel_mode="proportion
             continue
             
         # Sample with replacement if needed
-        idx1 = rng.choice(cells1, size=count, replace=(count > len(cells1)))
-        idx2 = rng.choice(cells2, size=count, replace=(count > len(cells2)))
+        if use_sample_int:
+            pos1 = sample_int_r(len(cells1), count, replace=(count > len(cells1)), rng=sample_rng) - 1
+            pos2 = sample_int_r(len(cells2), count, replace=(count > len(cells2)), rng=sample_rng) - 1
+            idx1 = cells1[pos1]
+            idx2 = cells2[pos2]
+        else:
+            idx1 = _sample_python(cells1, size=count, rng=rng, replace=(count > len(cells1)))
+            idx2 = _sample_python(cells2, size=count, rng=rng, replace=(count > len(cells2)))
         
         pairs = np.column_stack((idx1, idx2))
         all_pairs.append(pairs)
@@ -328,7 +403,38 @@ def get_cell_pairs(clusters, n=1000, ls=None, q=(0.1, 0.9), sel_mode="proportion
         all_origins.extend([origin_label] * count)
         
     if len(all_pairs) > 0:
-        return np.vstack(all_pairs), all_origins
+        pairs_arr = np.vstack(all_pairs)
+        origins_arr = np.array(all_origins, dtype=object)
+
+        # Debug: dump pre-dedup pairs
+        if debug_outdir is not None:
+            try:
+                import os
+                os.makedirs(debug_outdir, exist_ok=True)
+                pd.DataFrame(pairs_arr, columns=['i1','i2']).to_csv(os.path.join(debug_outdir, 'get_cell_pairs_pre_dedupe.csv'), index=False)
+            except Exception:
+                pass
+
+        # Remove duplicated rows in the same order as R's duplicated(ca)
+        ca_df = pd.DataFrame({
+            'cell1': pairs_arr[:, 0],
+            'cell2': pairs_arr[:, 1],
+            'orig.clusters': origins_arr,
+        })
+        keep_mask = ~ca_df.duplicated(keep='first')
+        pairs_unique = pairs_arr[keep_mask.to_numpy()]
+        origins_unique = origins_arr[keep_mask.to_numpy()].tolist()
+
+        # Debug: dump post-dedup pairs
+        if debug_outdir is not None:
+            try:
+                import os
+                pd.DataFrame(pairs_unique, columns=['i1','i2']).to_csv(os.path.join(debug_outdir, 'get_cell_pairs_post_dedupe.csv'), index=False)
+                pd.DataFrame({'origin': origins_unique}).to_csv(os.path.join(debug_outdir, 'get_cell_pairs_post_origins.csv'), index=False)
+            except Exception:
+                pass
+
+        return pairs_unique, origins_unique
     else:
         return np.empty((0, 2), dtype=int), []
 
@@ -338,6 +444,7 @@ def _get_meta_cells(X, clusters, n_meta_cells=20, meta_cell_size=20, rng=None):
     Returns (meta_X, meta_clusters)
     """
     rng = _coerce_rng(rng=rng)
+    sample_rng = rng
     clusters = np.asarray(clusters)
     unique_clusters = np.unique(clusters)
     
@@ -357,7 +464,8 @@ def _get_meta_cells(X, clusters, n_meta_cells=20, meta_cell_size=20, rng=None):
         
         # R logic: sample(...) replace=FALSE
         for _ in range(n_meta_cells):
-            sample_idx = rng.choice(c_indices, size=size_to_sample, replace=False)
+            sample_idx = sample_int_r(len(c_indices), size_to_sample, replace=False, rng=sample_rng) - 1
+            sample_idx = c_indices[sample_idx]
             
             # Use X[sample_idx] and Compute Mean
             # mean(axis=0) creates a matrix (1, n_genes) -> convert to 1D array
@@ -378,7 +486,7 @@ def _get_meta_cells(X, clusters, n_meta_cells=20, meta_cell_size=20, rng=None):
 def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
                             half_size=0.25, adjust_size=0.25, prop_random=0.1,
                             sel_mode="proportional", n_meta_cells=2, meta_triplets=True, 
-                            trim_q=(0.05, 0.95), random_state=0, rng=None):
+                            trim_q=(0.05, 0.95), random_state=0, rng=None, debug_outdir=None):
     """
     Main orchestration function to get artificial doublets.
     
@@ -388,6 +496,7 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
         X = sp.csr_matrix(X)
 
     rng = _coerce_rng(random_state=random_state, rng=rng)
+    sample_rng = rng
         
     n_cells = X.shape[0]
     ls = np.array(X.sum(axis=1)).flatten()
@@ -431,34 +540,38 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
         # Generate random pairs.
         # Match R: sample 2*n indices, without replacement when possible, then reshape.
         replace = (2 * n_random >= n_curr)
-        sampled = rng.choice(n_curr, size=2 * n_random, replace=replace)
-        pairs_r = sampled.reshape(-1, 2)
+        sampled = sample_int_r(n_curr, size=2 * n_random, replace=replace, rng=sample_rng) - 1
+        # R fills sampled values column-major when reshaping into pairs
+        pairs_r = sampled.reshape(-1, 2, order='F')
+        # Remove self-pairs
         pairs_r = pairs_r[pairs_r[:, 0] != pairs_r[:, 1]]
         
         if clusters is None:
             # If no clusters, everything is random
-            X_rand = create_doublets(X_curr, pairs_r, adjust_size=False, resamp=resamp, half_size=half_size, random_state=random_state, rng=rng)
+            X_rand = create_doublets(X_curr, pairs_r, adjust_size=False, resamp=resamp, half_size=half_size, random_state=random_state, rng=rng, debug_outdir=debug_outdir)
             orig_rand = [np.nan] * X_rand.shape[0]
         else:
             # Map random pairs to their clusters
             c1 = clusters_curr[pairs_r[:, 0]]
             c2 = clusters_curr[pairs_r[:, 1]]
-            orig_rand = [f"{a}+{b}" for a, b in zip(c1, c2)]
+            # Match R's paste ordering for random pairs (reverse order)
+            orig_rand = [f"{b}+{a}" for a, b in zip(c1, c2)]
             X_rand = create_doublets(X_curr, pairs_r, clusters=clusters_curr, adjust_size=adjust_size, 
-                                     resamp=resamp, half_size=half_size, random_state=random_state, rng=rng)
+                                     resamp=resamp, half_size=half_size, random_state=random_state, rng=rng, debug_outdir=debug_outdir)
         
         results_X.append(X_rand)
         results_origins.extend(orig_rand)
 
     # 3. Cross-Cluster Doublets (Heterotypic)
-    n_cluster_dbl = n - n_random
+    n_main = int(np.ceil(n * (1 - prop_random))) if clusters is not None else n
+    n_cluster_dbl = int(np.ceil(n_main * (0.9 if (clusters is not None and n_meta_cells > 0) else 1.0)))
     if n_cluster_dbl > 0 and clusters is not None:
         
-        ca_pairs, ca_origins = get_cell_pairs(clusters_curr, n=n_cluster_dbl, sel_mode=sel_mode)
+        ca_pairs, ca_origins = get_cell_pairs(clusters_curr, n=n_cluster_dbl, sel_mode=sel_mode, rng=rng, debug_outdir=debug_outdir, use_sample_int=True)
         
         if len(ca_pairs) > 0:
             X_cluster = create_doublets(X_curr, ca_pairs, clusters=clusters_curr,
-                                        adjust_size=adjust_size, half_size=half_size, resamp=resamp, random_state=random_state, rng=rng)
+                                        adjust_size=adjust_size, half_size=half_size, resamp=resamp, random_state=random_state, rng=rng, debug_outdir=debug_outdir)
             results_X.append(X_cluster)
             results_origins.extend(ca_origins)
 
@@ -472,14 +585,14 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
         meta_X, meta_cl = _get_meta_cells(X_curr, clusters_curr, n_meta_cells=n_meta_cells, meta_cell_size=30, rng=rng)
         
         if meta_X is not None:
-            n_meta_dbl = int(np.ceil(n * 0.1)) # 10%
+            n_meta_dbl = int(np.ceil(n_main * 0.1)) # 10% of the reduced main count
 
-            ca_meta_pairs, ca_meta_origins = get_cell_pairs(meta_cl, n=n_meta_dbl, rng=rng)
+            ca_meta_pairs, ca_meta_origins = get_cell_pairs(meta_cl, n=n_meta_dbl, rng=rng, debug_outdir=debug_outdir, use_sample_int=True)
 
             if len(ca_meta_pairs) > 0:
                 # R: createDoublets(..., resamp=TRUE) -> resamp=1.0
                 X_meta_dbl = create_doublets(meta_X, ca_meta_pairs, clusters=meta_cl,
-                                             adjust_size=False, half_size=False, resamp=1.0, random_state=random_state, rng=rng)
+                                             adjust_size=False, half_size=False, resamp=1.0, random_state=random_state, rng=rng, debug_outdir=debug_outdir)
 
                 results_X.append(X_meta_dbl)
                 results_origins.extend(ca_meta_origins)

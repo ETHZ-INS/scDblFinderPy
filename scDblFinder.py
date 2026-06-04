@@ -2,16 +2,21 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import random
+import os
+import json
+import time
 from anndata import AnnData
 import scipy.sparse as sp
 from sklearn.neighbors import NearestNeighbors
 import xgboost as xgb
 import warnings
+import glob
 
 from .clustering import fast_cluster
 from .doublet_generation import get_artificial_doublets
 from .misc import cxds2, select_features
 from .thresholding import _gdbr, doublet_thresholding_optim
+from .rng import coerce_rng
 
 def _filter_unrecognizable_doublets(d, minSize=5, minMedDiff=0.1):
     src = d['src'].values
@@ -67,7 +72,7 @@ def compute_doublet_score(
     n_iters=3,
     # R parameter equivalents
     clust_cor=None, # clustCor
-    prop_random=0.1, # propRandom
+    prop_random=0.1, # propRandom (R default)
     adjust_size=0.25,
     meta_triplets=True,
     prop_markers=0.0, # propMarkers
@@ -84,7 +89,8 @@ def compute_doublet_score(
     dbr_per1k=0.008,
     stringency=0.5,
     return_type='adata', 
-    verbose=True
+    verbose=True,
+    debug=False
 ):
     """
     Main function to compute doublet scores using the scDblFinder method.
@@ -140,8 +146,8 @@ def compute_doublet_score(
     if samples_col is not None:
         warnings.warn("multi_sample_mode has been removed; samples_col is ignored.")
 
-    np.random.seed(random_state)
-    random.seed(random_state)
+    # Central RNG: drives all randomness in the pipeline
+    central_rng = coerce_rng(random_state=random_state)
 
     # 1. Preprocessing & Clustering
     # -----------------------------
@@ -165,8 +171,9 @@ def compute_doublet_score(
     if clusters_col:
         if clusters_col not in adata.obs:
             if verbose: print("Clustering cells...")
+            # derive an int seed for external libraries from central RNG
             fast_cluster(adata, n_features=n_features, n_components=n_components, 
-                         key_added=clusters_col, use_gpu=use_gpu, random_state=random_state,
+                         key_added=clusters_col, use_gpu=use_gpu, rng=central_rng,
                          verbose=verbose)
         
         clusters = adata.obs[clusters_col].values
@@ -199,7 +206,7 @@ def compute_doublet_score(
     n_cells = adata.n_obs
     if n_artificial is None:
         # R logic: min(25000, max(1500, ceiling(ncol(sce)*0.8), 10*length(unique(cl))^2 ))
-        n_artificial = min(25000, max(1500, int(n_cells * 0.8), 10 * n_clusters**2))
+        n_artificial = min(25000, max(1500, int(np.ceil(n_cells * 0.8)), 10 * n_clusters**2))
     
     if verbose: print(f"Generating {n_artificial} artificial doublets...")
     
@@ -207,8 +214,8 @@ def compute_doublet_score(
     X_counts = adata.layers['counts'] if 'counts' in adata.layers else adata.X
     
     # This returns a dictionary {"counts": ..., "origins": ...}
-    rng = np.random.default_rng(random_state)
-
+    # Pass central RNG into artificial doublet generator so all stochastic
+    # operations derive from the same sequence.
     res = get_artificial_doublets(
         X_counts, 
         n=n_artificial, 
@@ -217,7 +224,7 @@ def compute_doublet_score(
         adjust_size=adjust_size,
         meta_triplets=meta_triplets,
         random_state=random_state,
-        rng=rng
+        rng=central_rng
     )
     X_artificial = res['counts']
     origins = res['origins']
@@ -297,13 +304,138 @@ def compute_doublet_score(
     # ----------------------------
     if verbose: print("Processing and running PCA...")
     
-    # Normalize & Log & PCA
-    # We should perform this on the combined dataset
-    adata_combined.layers['counts'] = adata_combined.X.copy() # Backup counts if needed
-    
-    sc.pp.normalize_total(adata_combined, target_sum=1e4)
-    sc.pp.log1p(adata_combined)
-    sc.pp.pca(adata_combined, n_comps=n_components, random_state=random_state)
+    # Normalize & PCA - align with R's .defaultProcessing: normalizeCounts then PCA via Irlba
+    # Use the raw counts backup for R-like normalization
+    adata_combined.layers['counts'] = adata_combined.X.copy()
+    counts_mat = adata_combined.layers['counts']
+    # ensure dense numeric array for SVD
+    if sp.issparse(counts_mat):
+        counts_arr = counts_mat.toarray().astype(float)
+    else:
+        counts_arr = np.asarray(counts_mat, dtype=float)
+
+    # R normalizeCounts: library-size normalize, then transform before PCA.
+    lib_sizes = counts_arr.sum(axis=1)
+    mean_lib = lib_sizes.mean() if lib_sizes.size>0 else 1.0
+    size_factors = lib_sizes / mean_lib
+    # avoid division by zero
+    size_factors[size_factors == 0] = 1.0
+    norm_counts = counts_arr / size_factors[:, None]
+    # scuttle::normalizeCounts stores log-normalized values; use log2(1+x) to
+    # match the Bioconductor convention more closely than scanpy's default log1p.
+    norm_counts = np.log2(norm_counts + 1.0)
+
+    # center genes (columns) as scater::calculatePCA does centering before SVD
+    gene_means = np.mean(norm_counts, axis=0)
+    norm_centered = norm_counts - gene_means
+
+    # Compute PCA in pure Python using randomized SVD to mimic R's irlba
+    try:
+        from sklearn.utils.extmath import randomized_svd
+        n_comp_eff = min(n_components, min(norm_centered.shape))
+        # randomized_svd expects (n_samples, n_features) array
+        # use a deterministic seed derived from random_state for reproducibility
+        rand_state = random_state if isinstance(random_state, (int, float)) else 42
+        U, S, VT = randomized_svd(norm_centered, n_components=n_comp_eff, random_state=int(rand_state))
+        pcs = U[:, :n_comp_eff] * S[:n_comp_eff]
+    except Exception:
+        try:
+            # fallback to full SVD
+            U, S, VT = np.linalg.svd(norm_centered, full_matrices=False)
+            k = min(n_components, U.shape[1])
+            pcs = U[:, :k] * S[:k]
+        except Exception:
+            # final fallback: use sklearn PCA on the log-normalized counts
+            from sklearn.decomposition import PCA
+            n_comp_eff = min(n_components, min(norm_centered.shape))
+            pca = PCA(n_components=n_comp_eff, svd_solver='auto', random_state=int(random_state if isinstance(random_state, (int, float)) else 42))
+            pcs = pca.fit_transform(norm_centered)
+
+    # store PCA coordinates in obsm as cells x components
+    adata_combined.obsm['X_pca'] = pcs
+
+    # Compute cluster-correlations predictors if requested (clustCor in R)
+    # R computes these on the counts matrix before PCA and adds them to the
+    # predictors table. Here we approximate that behavior: when `clust_cor` is
+    # an integer, pick top-n markers per cluster by mean expression; when it is
+    # a 2D array/DataFrame, use its columns as signatures and correlate.
+    if clust_cor is not None and clusters is not None:
+        try:
+            from scipy.stats import rankdata
+            counts_mat = adata_combined.layers['counts'] if 'counts' in adata_combined.layers else adata_combined.X
+            # ensure dense for computations
+            if sp.issparse(counts_mat):
+                counts_dense = counts_mat.toarray()
+            else:
+                counts_dense = np.asarray(counts_mat)
+
+            cluster_labels = np.asarray(clusters)
+            uniq_clusters = np.unique(cluster_labels)
+            clustcor_cols = []
+            if hasattr(clust_cor, 'shape') and len(np.shape(clust_cor)) == 2:
+                # matrix-like: rows should correspond to genes (var_names)
+                if isinstance(clust_cor, pd.DataFrame):
+                    mat = clust_cor.copy()
+                else:
+                    mat = pd.DataFrame(clust_cor, index=adata_combined.var_names)
+                # intersect genes
+                common = np.intersect1d(adata_combined.var_names, mat.index)
+                if len(common) >= 5:
+                    sub_counts = pd.DataFrame(counts_dense[:, [list(adata_combined.var_names).index(g) for g in common]], columns=common)
+                    for col in mat.columns:
+                        sig = mat.loc[common, col].values
+                        # compute Spearman correlation between each cell and signature
+                        # compute ranks
+                        sig_rank = rankdata(sig)
+                        vals = []
+                        for r in range(sub_counts.shape[0]):
+                            cell_rank = rankdata(sub_counts.iloc[r].values)
+                            # Pearson on ranks
+                            num = np.cov(cell_rank, sig_rank, bias=True)[0,1]
+                            den = np.std(cell_rank) * np.std(sig_rank)
+                            vals.append(0.0 if den == 0 else num/den)
+                        colname = f'clustCor_{col}'
+                        adata_combined.obs[colname] = vals
+                        clustcor_cols.append(colname)
+            else:
+                # integer: pick markers per cluster
+                try:
+                    nmark = int(clust_cor)
+                except Exception:
+                    nmark = None
+                if nmark and nmark > 0:
+                    # compute cluster means (cells x genes)
+                    means = {}
+                    markers = set()
+                    for cl in uniq_clusters:
+                        idx = np.where(cluster_labels == cl)[0]
+                        if idx.size == 0:
+                            continue
+                        meanvec = counts_dense[idx].mean(axis=0)
+                        top_idx = np.argsort(meanvec)[-nmark:]
+                        for ti in top_idx:
+                            markers.add(ti)
+                        means[cl] = meanvec
+                    markers = sorted(list(markers))
+                    if len(markers) >= 5:
+                        sub_counts = counts_dense[:, markers]
+                        for cl in uniq_clusters:
+                            sig = means.get(cl, np.zeros(counts_dense.shape[1]))[markers]
+                            sig_rank = rankdata(sig)
+                            vals = []
+                            for r in range(sub_counts.shape[0]):
+                                cell_rank = rankdata(sub_counts[r])
+                                num = np.cov(cell_rank, sig_rank, bias=True)[0,1]
+                                den = np.std(cell_rank) * np.std(sig_rank)
+                                vals.append(0.0 if den == 0 else num/den)
+                            colname = f'clustCor_{cl}'
+                            adata_combined.obs[colname] = vals
+                            clustcor_cols.append(colname)
+            if verbose and len(clustcor_cols)>0:
+                print(f"Added clustCor predictors: {clustcor_cols}")
+        except Exception as e:
+            if verbose:
+                print('Failed to compute clustCor predictors:', e)
     
     # 5. KNN & Doublet Features
     # -------------------------
@@ -331,36 +463,7 @@ def compute_doublet_score(
     # ctype factor: 1=real (or singlet assumption), 2=doublet (artificial + known)
     # inclInTrain: real=TRUE, artificial=TRUE.
     # Then iteratively: real cells with high score are removed from training (inclInTrain=FALSE)
-    
-    # Prepare training data
-    # Features to use:
-    # R defaults: setdiff(all, meta_cols)
-    # Explicitly R excludes: distanceToNearest, distanceToNearestDoublet
-    # usage: cxds_score, total_counts, n_features, weighted_density, distance_to_real, ratio_doublets, difficulty
-    
-    if training_features == 'default':
-        feature_cols = [
-            'cxds_score', 
-            'total_counts', 
-            'n_features', 
-            'weighted_density', 
-            'distance_to_real', 
-            'difficulty'
-        ]
-        k_vals = np.sort(np.unique([k for k in [3, 10, 15, 20, 25, 50, n_neighbors] if k <= n_neighbors]))
-        feature_cols.extend([f'ratio_doublets_{ki}' for ki in k_vals])
-    else:
-        feature_cols = training_features
-        
-    # remove non-numeric or non-feature keys
-    feature_cols = [c for c in feature_cols if c in adata_combined.obs.columns]
-    
-    if verbose: print(f"Training features: {feature_cols}")
-    
-    # Add PCA components as features?
-    # R: addVals=pca[,includePCs] -> Yes, PCA coords are used.
-    # We can handle this by constructing X_train as concat of obs[features] and obsm['X_pca']
-    
+
     # Initial labels
     # 0 = Real (Assumed Singlet), 1 = Artificial Doublet
     # Note: If we had known doublets in real data, they would be 1.
@@ -368,9 +471,9 @@ def compute_doublet_score(
     y = np.zeros(adata_combined.n_obs, dtype=int)
     y[adata_combined.obs['type'] == 'artificial'] = 1
     
-    # Training mask
+    # Training mask mirrors the R flow and is updated after each iteration.
     train_mask = np.ones(adata_combined.n_obs, dtype=bool)
-    adata_combined.obs['include.in.training'] = True
+    adata_combined.obs['include.in.training'] = train_mask
     
     # Iterative Training
     # n_iters=1 means run once.
@@ -378,9 +481,15 @@ def compute_doublet_score(
     scores = None
 
     # R-style initial score seed before iterative xgboost training.
-    ratio_max = np.max(adata_combined.obs['ratio_doublets'].values)
-    ratio_scaled = adata_combined.obs['ratio_doublets'].values / max(ratio_max, 1e-12)
-    scores = (adata_combined.obs['cxds_score'].values + ratio_scaled) / 2.0
+    ratio_feature_cols = sorted(
+        [c for c in adata_combined.obs.columns if c.startswith('ratio_doublets_')],
+        key=lambda x: int(x.rsplit('_', 1)[1])
+    )
+    if not ratio_feature_cols:
+        raise ValueError('No ratio_doublets_* features were generated for the initial score')
+    ratio_feature = ratio_feature_cols[-1]
+    ratio_vals = adata_combined.obs[ratio_feature].values
+    scores = (adata_combined.obs['cxds_score'].values + ratio_vals / max(np.max(ratio_vals), 1e-12)) / 2.0
     adata_combined.obs['scDblFinder_score'] = scores
 
     # Match .scDblscore default handling when dbr.sd is not provided.
@@ -388,10 +497,60 @@ def compute_doublet_score(
     gdbr = _gdbr(d_tmp, dbr=dbr, dbr_per1k=dbr_per1k)
     dbr_sd_eff = dbr_sd if dbr_sd is not None else (0.3 * gdbr + 0.025)
 
+    # Prepare training data after KNN-derived features have been added.
+    # This mirrors the R flow, where the scorer sees the full post-KNN table.
+    if training_features == 'default':
+        excluded_features = {
+            'most_likely_origin',
+            'originAmbiguous',
+            'distance_to_nearest_doublet',
+            'distance_to_nearest',
+            'scDblFinder_score',
+            'type',
+            'src',
+            'class',
+            'nearestClass',
+            'cluster',
+            'sample',
+            'expected',
+            'include.in.training',
+            'observed',
+        }
+        ratio_cols = [c for c in adata_combined.obs.columns if c.startswith('ratio_doublets_')]
+        ordered_candidates = [
+            'weighted_density',
+            'distance_to_nearest_real',
+            *ratio_cols,
+            'difficulty',
+            'total_counts',
+            'n_features',
+            'nAbove2',
+            'cxds_score',
+        ]
+        # include any clustCor-derived columns (added earlier) so they are available for training
+        clustcor_cols = [c for c in adata_combined.obs.columns if str(c).startswith('clustCor_')]
+        if clustcor_cols:
+            ordered_candidates = ordered_candidates + clustcor_cols
+        feature_cols = [
+            c for c in ordered_candidates
+            if c in adata_combined.obs.columns
+            and c not in excluded_features
+            and pd.api.types.is_numeric_dtype(adata_combined.obs[c])
+        ]
+    else:
+        feature_cols = [c for c in training_features if c in adata_combined.obs.columns]
+
+    if verbose:
+        print(f"Training features: {feature_cols}")
+
     # Build full design matrix once (features + PCA), equivalent to `preds` + `addVals`.
+    # R's scDblFinder defaults to includePCs=19 and then keeps only PCs with index
+    # strictly less than ncol(pca), so with 20 PCs it uses PC1..PC19.
     X_features = adata_combined.obs[feature_cols].values
     X_pca = adata_combined.obsm['X_pca']
-    X_full = np.hstack([X_features, X_pca])
+    n_include_pcs = max(0, min(19, X_pca.shape[1] - 1))
+    X_pca_used = X_pca[:, :n_include_pcs]
+    X_full = np.hstack([X_features, X_pca_used])
 
     real_mask_all = adata_combined.obs['type'].values == 'real'
     dbl_mask_all = ~real_mask_all
@@ -448,6 +607,7 @@ def compute_doublet_score(
             print(f"iter={i}, {int(np.sum(excluded))} cells excluded from training.")
 
         train_idx = np.where(~excluded)[0]
+        n_estimators_local = None
         if train_idx.size > 10 and np.unique(y[train_idx]).size == 2:
             X_train = X_full[train_idx]
             y_train = y[train_idx]
@@ -462,7 +622,6 @@ def compute_doublet_score(
                 'tree_method': 'exact',
                 'nthread': 1,
                 'seed': random_state,
-                'seed_per_iteration': True,
             }
 
             if nrounds is None or nrounds < 1:
@@ -490,7 +649,8 @@ def compute_doublet_score(
                     n_estimators = int(max(1, valid_rounds[0] + 1)) if len(valid_rounds) > 0 else int(max(1, best_idx + 1))
             else:
                 n_estimators = int(max(1, nrounds))
-
+            # Record chosen estimator count for debug traces
+            n_estimators_local = int(n_estimators)
             bst = xgb.train(
                 params,
                 dtrain,
@@ -499,7 +659,127 @@ def compute_doublet_score(
             dfull = xgb.DMatrix(X_full)
             scores = bst.predict(dfull)
 
+            trace_bundle_ts = int(time.time()) if debug else None
+
+            # If debugging, capture CV results, chosen rounds and model info
+            if debug:
+                try:
+                    trace_dir = os.path.join(os.getcwd(), 'scdbl_traces')
+                    os.makedirs(trace_dir, exist_ok=True)
+                    trace_ts = trace_bundle_ts if trace_bundle_ts is not None else int(time.time())
+                    try:
+                        pca_dims = X_pca_used.shape[1]
+                    except Exception:
+                        pca_dims = 0
+                    feature_names = list(feature_cols) + [f'PC{i+1}' for i in range(pca_dims)]
+                    trace_npz = os.path.join(trace_dir, f"trace_iter_{trace_ts}_{i}.npz")
+                    obs_names_arr = np.asarray(adata_combined.obs_names.astype(str)) if hasattr(adata_combined, 'obs_names') else None
+                    knn_inds = None
+                    knn_dists = None
+                    try:
+                        knn_inds = adata_combined.obsm.get('knn_indices', None)
+                        knn_dists = adata_combined.obsm.get('knn_distances', None)
+                    except Exception:
+                        pass
+                    np.savez_compressed(
+                        trace_npz,
+                        X_full=X_full,
+                        scores=np.asarray(scores),
+                        y=np.asarray(y),
+                        train_idx=np.asarray(train_idx),
+                        obs_names=obs_names_arr,
+                        knn_indices=knn_inds,
+                        knn_distances=knn_dists,
+                    )
+                    fn_path = os.path.join(trace_dir, f"feature_names_iter_{trace_ts}_{i}.json")
+                    with open(fn_path, 'w') as ffn:
+                        json.dump(feature_names, ffn)
+                    if 'cv_results' in locals() and cv_results is not None:
+                        cv_path = os.path.join(trace_dir, f"cv_iter_{trace_ts}_{i}.csv")
+                        try:
+                            cv_results.to_csv(cv_path, index=True)
+                        except Exception:
+                            try:
+                                cv_results.to_json(cv_path + '.json', orient='split')
+                            except Exception:
+                                pass
+                    try:
+                        imp = bst.get_score(importance_type='weight')
+                        imp_path = os.path.join(trace_dir, f"imp_iter_{trace_ts}_{i}.json")
+                        with open(imp_path, 'w') as fimp:
+                            json.dump(imp, fimp)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    if verbose:
+                        print(f"Failed to write debug traces: {e}")
+
         adata_combined.obs['scDblFinder_score'] = scores
+
+        train_mask = ~excluded
+        # Do not write `include.in.training` back to `adata_combined.obs` here.
+        # R sets `d$include.in.training[w] <- FALSE` only after the iterative loop,
+        # so keep `train_mask` in memory and apply it once after the loop.
+
+        if debug:
+            debug_record = {
+                'timestamp': time.time(),
+                'n_cells_total': int(adata_combined.n_obs),
+                'iteration': int(i),
+                'n_real': int(n_real),
+                'n_artificial': int(n_dbl),
+                'w1_count': int(np.sum(w1_mask)),
+                'w2_count': int(np.sum(w2_mask)),
+                'excluded_count': int(np.sum(excluded)),
+                'train_idx_size': int(train_idx.size),
+                'n_estimators': n_estimators_local,
+                'drop_origins': list(drop_origins) if 'drop_origins' in locals() else [],
+                'unident_th': float(unident_th),
+                'median_score_real': float(np.median(scores[real_mask_all])) if np.any(real_mask_all) else None,
+                'median_score_artificial': float(np.median(scores[dbl_mask_all])) if np.any(dbl_mask_all) else None,
+            }
+            try:
+                debug_ts = trace_bundle_ts if trace_bundle_ts is not None else int(time.time())
+                log_path = os.path.join(os.getcwd(), f"scdbl_debug_{debug_ts}.jsonl")
+                with open(log_path, 'a') as f:
+                    f.write(json.dumps(debug_record) + "\n")
+                if verbose:
+                    print(f"Wrote debug record to {log_path}")
+                # Always dump the iter_df and calls_iter for parity inspection
+                try:
+                    trace_dir = os.path.join(os.getcwd(), 'scdbl_traces')
+                    os.makedirs(trace_dir, exist_ok=True)
+                    iter_csv = os.path.join(trace_dir, f"iter_df_{debug_ts}_{i}.csv")
+                    # include cell identifiers as the CSV index for alignment with R
+                    try:
+                        iter_df.to_csv(iter_csv, index=True, index_label='cell_id')
+                    except Exception:
+                        iter_df.to_csv(iter_csv, index=False)
+                    calls_path = os.path.join(trace_dir, f"calls_iter_{debug_ts}_{i}.npy")
+                    np.save(calls_path, calls_iter)
+                except Exception as e:
+                    if verbose:
+                        print(f"Failed to write iter_df/calls_iter: {e}")
+            except Exception as e:
+                if verbose:
+                    print(f"Failed to write debug record: {e}")
+                # Also dump the iter_df and calls_iter for parity inspection
+                try:
+                    debug_ts = trace_bundle_ts if trace_bundle_ts is not None else int(time.time())
+                    trace_dir = os.path.join(os.getcwd(), 'scdbl_traces')
+                    os.makedirs(trace_dir, exist_ok=True)
+                    iter_csv = os.path.join(trace_dir, f"iter_df_{debug_ts}_{i}.csv")
+                    # include cell identifiers as the CSV index for alignment with R
+                    try:
+                        iter_df.to_csv(iter_csv, index=True, index_label='cell_id')
+                    except Exception:
+                        iter_df.to_csv(iter_csv, index=False)
+                    calls_path = os.path.join(trace_dir, f"calls_iter_{debug_ts}_{i}.npy")
+                    # save calls_iter as array of strings
+                    np.save(calls_path, calls_iter)
+                except Exception as e:
+                    if verbose:
+                        print(f"Failed to write iter_df/calls_iter: {e}")
 
         # Update difficulty proxy from model score similarly to R iterative update.
         if 'most_likely_origin' in adata_combined.obs.columns:
@@ -520,28 +800,36 @@ def compute_doublet_score(
                 difficulty[m] = 1.0 - mapped_vals[m]
                 adata_combined.obs['difficulty'] = difficulty
 
-        train_mask = ~excluded
-        adata_combined.obs['include.in.training'] = train_mask
-
         if bool(filter_unidentifiable) and i == n_iters - 1:
             tmp_d = adata_combined.obs[['src', 'most_likely_origin', 'type']].copy()
             tmp_d['score'] = scores
             tmp_d['cluster'] = adata_combined.obs[clusters_col].values if clusters_col else 1
             drop_origins = _filter_unrecognizable_doublets(tmp_d)
             if len(drop_origins) > 0:
-                drop_mask = (tmp_d['src'] == 'artificial') & tmp_d['most_likely_origin'].isin(drop_origins).values
+                drop_mask = ((tmp_d['src'] == 'artificial') & tmp_d['most_likely_origin'].isin(drop_origins)).to_numpy()
                 if np.any(drop_mask):
-                    keep_mask = ~drop_mask
+                    keep_mask = np.asarray(~drop_mask, dtype=bool)
+                    if keep_mask.shape[0] != adata_combined.n_obs:
+                        raise ValueError(
+                            f"Final unidentifiable-doublet mask has length {keep_mask.shape[0]} "
+                            f"but adata_combined has {adata_combined.n_obs} rows"
+                        )
                     adata_combined = adata_combined[keep_mask].copy()
-                    scores = scores[keep_mask]
-                    train_mask = train_mask[keep_mask]
-                    real_mask_all = real_mask_all[keep_mask]
-                    dbl_mask_all = dbl_mask_all[keep_mask]
+                    scores = np.asarray(scores)[keep_mask]
+                    train_mask = np.asarray(train_mask, dtype=bool)[keep_mask]
+                    real_mask_all = np.asarray(real_mask_all, dtype=bool)[keep_mask]
+                    dbl_mask_all = np.asarray(dbl_mask_all, dtype=bool)[keep_mask]
                     X_full = X_full[keep_mask]
-                    y = y[keep_mask]
+                    y = np.asarray(y, dtype=int)[keep_mask]
 
     # 7. Thresholding (optim)
     # -----------------------
+    # Apply final include.in.training flags now (matches R: set after loop)
+    try:
+        adata_combined.obs['include.in.training'] = train_mask
+    except Exception:
+        # If train_mask shape changed due to final filtering, align by length
+        adata_combined.obs['include.in.training'] = np.asarray(train_mask, dtype=bool)
     # Keep parity with the R `optim` threshold path used in the current flow.
     cols = ["type", "src", "include.in.training"]
     if clusters_col:
@@ -611,20 +899,45 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
     # We need to map string origins to integers for efficient processing or use arrays?
     origins = adata.obs['most_likely_origin'].values.copy()
     
-    # Train KNN
-    # Using sklearn for consistency, or scanpy
-    # Match R/BiocNeighbors behavior by excluding each point itself from neighbors.
-    nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm='auto', n_jobs=-1).fit(X_pca)
+    # Train KNN.
+    # Use sklearn's KNN to get candidate neighbors, then enforce deterministic
+    # tie-breaking and explicit self-neighbor ordering to match BiocNeighbors::findKNN
+    nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', n_jobs=-1).fit(X_pca)
     distances, indices = nbrs.kneighbors(X_pca)
-    # Drop self-neighbor column (typically first, with distance 0 and identical index).
-    distances = distances[:, 1:]
-    indices = indices[:, 1:]
-    
-    n_obs = X_obs = X_pca.shape[0]
-    
-    # 1. Distance to nearest (kth)
-    # distances is (n_obs, n_neighbors). Last column is distance to kth.
-    dist_to_k = distances[:, -1]
+
+    n_obs = X_pca.shape[0]
+
+    # Enforce deterministic ordering: sort neighbors by (distance, index)
+    # so ties on distance are broken consistently by index order (ascending).
+    for i in range(n_obs):
+        row_d = distances[i]
+        row_idx = indices[i]
+        # lexsort takes keys with the last key as primary; provide (row_idx, row_d)
+        order = np.lexsort((row_idx, row_d))
+        distances[i] = row_d[order]
+        indices[i] = row_idx[order]
+        # Ensure self is present and placed first. If missing, insert self with zero
+        # distance and drop the last neighbor to keep count stable.
+        self_pos = np.where(indices[i] == i)[0]
+        if self_pos.size > 0:
+            if self_pos[0] != 0:
+                pos = int(self_pos[0])
+                indices[i] = np.concatenate(([indices[i][pos]], np.delete(indices[i], pos)))
+                distances[i] = np.concatenate(([distances[i][pos]], np.delete(distances[i], pos)))
+        else:
+            # prepend self
+            indices[i] = np.concatenate(([i], indices[i][:-1]))
+            distances[i] = np.concatenate(([0.0], distances[i][:-1]))
+
+    # 1. Distance to nearest.
+    # R stores the first neighbor distance (after replacing self-distance 0s).
+    dist_to_k = distances[:, 0].copy()
+    if np.any(dist_to_k == 0):
+        positive_first = dist_to_k[dist_to_k > 0]
+        if positive_first.size > 0:
+            dist_to_k[dist_to_k == 0] = positive_first.min()
+        else:
+            dist_to_k[dist_to_k == 0] = 1e-6
     
     # 2. Ratio of doublets in neighborhood
     # indices is (n_obs, n_neighbors)
@@ -641,14 +954,15 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
     # R: dw <- sqrt(k - seq_len(k)) * 1/dist
     # Python: weights based on rank/distance
     
-    # Check for zero dists
+    # Check for zero dists, matching the R code that replaces any 0 in the first
+    # nearest-neighbor distance column with the smallest positive first-neighbor distance.
     SAFE_DIST = distances.copy()
     first_col = SAFE_DIST[:, 0]
     min_gt_0 = first_col[first_col > 0].min() if (first_col > 0).any() else 1e-6
     SAFE_DIST[SAFE_DIST == 0] = min_gt_0
-    
+
     ranks = np.arange(1, n_neighbors + 1)
-    rank_weights = np.sqrt(n_neighbors - ranks) # Shape (n_neighbors,)
+    rank_weights = np.sqrt(n_neighbors - ranks)  # Shape (n_neighbors,)
     
     # Distance weighting: 1 / distance
     dist_weights = 1.0 / SAFE_DIST
@@ -684,6 +998,10 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
     rev_origin_map = {i: o for i, o in enumerate(unique_origins)}
     n_origins = len(unique_origins)
     
+    # default values when there are no origins
+    origin_ambiguous = np.full(n_obs, False, dtype=bool)
+    final_origins = np.full(n_obs, -1, dtype=int)
+
     if n_origins > 0:
         # Convert origins to numeric, -1 for NaN
         origins_num = np.full(len(origins), -1, dtype=int)
@@ -698,44 +1016,59 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
         origins_num = mapped
         
         neighbor_origins_num = origins_num[indices] # (N x k)
-        
-        # Calculate mode per row, ignoring -1
-        # Bincount per row? Too slow.
-        # Scipy mode? `scipy.stats.mode` handles axis.
-        
-        from scipy.stats import mode
-        # mode returns smallest value if multiple. -1 is smallest.
-        # We want to ignore -1.
-        
-        # Helper to compute mode ignoring -1
-        def mode_ignoring_neg1(arr):
-             # Expects 2D array
-             # Replace -1 with max+1 to push to end if using sort?
-             # Or use bincount on flattened and reshape?
-             pass
 
-        # Simple python loop for now to be safe and correct
-        # Or faster: only where ratio_k > 0 (has doublet neighbors)
-        
+        # Implement R's .getMostLikelyOrigins tie-breaking logic.
+        # For each cell: if all NA -> (NA, NA); else if only one origin -> (that, FALSE)
+        # else if unique max -> (that, FALSE). If tie, compare min distances per origin
+        # and check whether (x2 - x1) / x1 > 0.2 to mark unambiguous.
         final_origins = np.full(n_obs, -1, dtype=int)
-        
-        # We can just iterate. 10k cells x 50 neighbors is 500k ops, fast enough.
-        # Actually standard python loop is slow.
-        
-        # Use simple heuristic: if ratio_doublets > 0, likely has origin.
-        # Most frequent positive integer in row.
-        
-        # Optimization: use pandas apply on the matrix of neighbor indices? No.
-        
+        origin_ambiguous = np.full(n_obs, False, dtype=bool)
+
         for i in range(n_obs):
             row = neighbor_origins_num[i]
             valid_neighbors = row[row >= 0]
-            if len(valid_neighbors) > 0:
-                # Find mode
-                vals, counts = np.unique(valid_neighbors, return_counts=True)
+            if len(valid_neighbors) == 0:
+                final_origins[i] = -1
+                origin_ambiguous[i] = False
+                continue
+            # counts per origin
+            vals, counts = np.unique(valid_neighbors, return_counts=True)
+            if len(vals) == 1:
+                final_origins[i] = vals[0]
+                origin_ambiguous[i] = False
+                continue
+            # check unique max
+            max_count = counts.max()
+            if np.sum(counts == max_count) == 1:
                 final_origins[i] = vals[np.argmax(counts)]
-                
-        # String origins
+                origin_ambiguous[i] = False
+                continue
+            # tie: compute min distance per origin among neighbors
+            origin_mins = []
+            origin_names = []
+            for v in vals:
+                mask = (neighbor_origins_num[i] == v)
+                if np.any(mask):
+                    min_dist = distances[i][mask].min()
+                else:
+                    min_dist = np.inf
+                origin_mins.append(min_dist)
+                origin_names.append(v)
+            origin_mins = np.array(origin_mins)
+            order = np.argsort(origin_mins)
+            if origin_mins[order].size >= 2:
+                x1 = origin_mins[order][0]
+                x2 = origin_mins[order][1]
+                if x1 <= 0:
+                    ambiguous = True
+                else:
+                    ambiguous = not ((x2 - x1) / x1 > 0.2)
+                final_origins[i] = origin_names[order[0]]
+                origin_ambiguous[i] = ambiguous
+            else:
+                final_origins[i] = origin_names[order[0]]
+                origin_ambiguous[i] = False
+
         most_likely_str = np.array([rev_origin_map[i] if i >= 0 else np.nan for i in final_origins], dtype=object)
         
     else:
@@ -769,22 +1102,52 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
         difficulty[valid_means] = 1.0 - mapped_means[valid_means]
 
     
-    # 5. Dist to nearest Real
-    # Efficiently find min dist to type 0
-    
-    real_mask = (neighbor_types == 0)
+    # 5. Dist to nearest Real / Doublet
+    # R computes the first nearest neighbor of the opposite type, not the minimum
+    # over all matching neighbors.
     max_dist = distances[:, 0].max() * 2
-    d_real = distances.copy()
-    d_real[~real_mask] = max_dist
-    dist_to_nearest_real = d_real.min(axis=1)
+    dist_to_nearest_real = np.empty(n_obs, dtype=float)
+    dist_to_nearest_doublet = np.empty(n_obs, dtype=float)
+    for idx in range(n_obs):
+        row_types = neighbor_types[idx]
+        row_dist = distances[idx]
+        dbl_hits = np.where(row_types == 1)[0]
+        real_hits = np.where(row_types == 0)[0]
+        # pick the nearest neighbor of the requested type but ignore self (rank 0)
+        def first_nonself(hits):
+            if hits.size == 0:
+                return None
+            if hits[0] == 0:
+                return hits[1] if hits.size > 1 else None
+            return hits[0]
+
+        di = first_nonself(dbl_hits)
+        ri = first_nonself(real_hits)
+        dist_to_nearest_doublet[idx] = row_dist[di] if di is not None else max_dist
+        dist_to_nearest_real[idx] = row_dist[ri] if ri is not None else max_dist
+
+    # 6. Count of counts > 2, matching R's nAbove2
+    counts_matrix = adata.layers['counts'] if 'counts' in adata.layers else adata.X
+    if sp.issparse(counts_matrix):
+        n_above2 = np.asarray((counts_matrix > 2).sum(axis=1)).ravel()
+    else:
+        n_above2 = np.sum(counts_matrix > 2, axis=1)
 
     res = {
         'distance_to_nearest': dist_to_k, # Keep for debug but exclude from features later
         'weighted_density': weighted_score,
-        'distance_to_real': dist_to_nearest_real,
+        'distance_to_nearest_real': dist_to_nearest_real,
+        'distance_to_nearest_doublet': dist_to_nearest_doublet,
+        'nAbove2': n_above2,
         'difficulty': difficulty,
         'most_likely_origin': most_likely_str,
-        'ratio_doublets': np.mean(neighbor_types[:, :n_neighbors], axis=1)
+        'origin_ambiguous': origin_ambiguous,
     }
     res.update(ratio_dict)
+    # Persist raw knn indices/distances for debugging/trace parity comparisons
+    try:
+        adata.obsm['knn_indices'] = indices
+        adata.obsm['knn_distances'] = distances
+    except Exception:
+        pass
     return res
