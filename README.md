@@ -22,129 +22,164 @@ At a high level, the pipeline is:
 4. Iterative XGBoost training and score refinement.
 5. Final thresholding to obtain doublet calls.
 
-Main entry point:
-- `scDblFinder.py` -> `compute_doublet_score(...)`
+## Repository layout
 
-## Repository layout (Python side)
-
-- `scDblFinder.py`: main pipeline and model training
-- `clustering.py`: fast clustering helper used in clustered mode
-- `doublet_generation.py`: artificial doublet generation
-- `misc.py`: feature engineering utilities (including cxds-like score)
-- `thresholding.py`: doublet threshold optimization
-
-## Requirements
-
-Python:
-- Python 3.9+
-
-Core packages:
-- `numpy`
-- `pandas`
-- `scipy`
-- `anndata`
-- `scanpy`
-- `scikit-learn`
-- `xgboost`
-
-Optional GPU-related packages:
-- `rapids-singlecell`
-- `cuml`
+```
+pyscDblFinder/              ← repo root (this directory is the Python package)
+├── scDblFinder.py          main pipeline — contains compute_doublet_score()
+├── clustering.py
+├── doublet_generation.py
+├── misc.py
+├── thresholding.py
+├── rng.py
+├── graph.py
+├── biocneighbors_kmknn.py
+├── louvain_controlled.py
+├── hw_kmeans.py
+├── r_mt19937.py
+├── r_sample_emulation.py
+```
 
 ## Setup
 
-From the repository root:
+### 1. Clone the repository
+
+```bash
+git clone <repo-url>
+cd pyscDblFinder
+```
+
+### 2. Create and activate a virtual environment
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
+```
+
+### 3. Install dependencies
+
+```bash
 pip install numpy pandas scipy anndata scanpy scikit-learn xgboost
 ```
 
-If you want to import the module from scripts in this repository root,
-this usually works directly because `scdblfinder/` is part of the repo.
+Optional — GPU acceleration (requires a CUDA-capable machine):
 
-## Input expectations
+```bash
+pip install rapids-singlecell cuml
+```
 
-`compute_doublet_score(...)` expects an `AnnData` object:
-- `adata.X` should contain raw counts (preferred), or
-- `adata.layers['counts']` should contain raw counts.
+## Using the package in your own scripts
 
-Ground-truth labels are not required for running the method itself.
-Ground truth is only needed for benchmark evaluation scripts.
+Because the repo root itself is the Python package, you need to add its
+**parent directory** to `sys.path` before importing. Assuming you cloned into
+`/path/to/pyscDblFinder`:
 
-## Quick start
+```python
+import sys
+sys.path.insert(0, "/path/to")   # parent of the pyscDblFinder/ directory
+from pyscDblFinder.scDblFinder import compute_doublet_score
+```
 
-### 1) Random mode (no clustering)
+### Input expectations
+
+`compute_doublet_score(...)` expects an `AnnData` object where:
+- `adata.X` contains raw counts (preferred), **or**
+- `adata.layers['counts']` contains raw counts.
+
+### Random mode (no clustering)
 
 ```python
 import scanpy as sc
-from scdblfinder.scDblFinder import compute_doublet_score
+import sys
+sys.path.insert(0, "/path/to")
+from pyscDblFinder.scDblFinder import compute_doublet_score
 
 adata = sc.read_h5ad("your_data.h5ad")
 adata_out = compute_doublet_score(
-	adata,
-	clusters_col=None,   # random mode
-	n_iters=3,
-	random_state=42,
-	verbose=True,
+    adata,
+    clusters_col=None,   # random mode — no clustering step
+    n_iters=3,
+    random_state=42,
+    verbose=True,
 )
 
 print(adata_out.obs[["scDblFinder_score", "scDblFinder_class"]].head())
 print("Threshold:", adata_out.uns.get("scDblFinder_threshold"))
 ```
 
-### 2) Clustered mode (auto clustering)
+### Clustered mode (auto clustering)
 
 ```python
-import scanpy as sc
-from scdblfinder.scDblFinder import compute_doublet_score
-
-adata = sc.read_h5ad("your_data.h5ad")
 adata_out = compute_doublet_score(
-	adata,
-	clusters_col="clusters",  # if missing, fast clustering is run and stored here
-	n_iters=3,
-	random_state=42,
-	verbose=True,
+    adata,
+    clusters_col="clusters",  # column is computed and stored here if absent
+    n_iters=3,
+    random_state=42,
+    verbose=True,
 )
 ```
 
-### 3) Clustered mode (precomputed clusters)
-
-If your data already has cluster labels:
+### Clustered mode (precomputed clusters)
 
 ```python
-adata.obs["my_clusters"] = ...
+adata.obs["my_clusters"] = ...   # your own cluster labels
 adata_out = compute_doublet_score(adata, clusters_col="my_clusters")
 ```
 
 ## Outputs
 
-After running `compute_doublet_score(...)`, the returned object includes:
-
 In `adata.obs`:
-- `scDblFinder_score`: continuous doublet score (higher means more likely doublet)
-- `scDblFinder_class`: final call (`doublet` or `singlet`)
+- `scDblFinder_score` — continuous doublet score (higher = more likely doublet)
+- `scDblFinder_class` — final call: `doublet` or `singlet`
 
 In `adata.uns`:
-- `scDblFinder_threshold`: threshold used to separate singlets and doublets
+- `scDblFinder_threshold` — the score threshold used for the final classification
 
 If `return_type='full'`, the returned object also includes artificial doublets.
 
-## Important parameters
+## Key parameters
 
-Commonly tuned parameters:
-- `clusters_col`: set to `None` for random mode, or a column name for clustered mode
-- `n_features`: number of selected genes used in feature selection
-- `n_components`: number of PCA components
-- `n_artificial`: override number of artificial doublets
-- `prop_random`: fraction of random artificial doublets
-- `n_iters`: iterative classifier refinement rounds
-- `dbr`, `dbr_sd`, `dbr_per1k`: expected doublet-rate controls for thresholding
-- `stringency`: threshold optimization aggressiveness
-- `random_state`: reproducibility seed
+| Parameter | Default | Description |
+|---|---|---|
+| `clusters_col` | `None` | `None` for random mode; column name for clustered mode |
+| `n_features` | `1352` | number of genes used for feature selection |
+| `n_components` | `20` | number of PCA components |
+| `n_artificial` | `None` | override number of artificial doublets (auto if `None`) |
+| `prop_random` | `0.1` | fraction of artificial doublets generated randomly |
+| `n_iters` | `3` | iterative classifier refinement rounds |
+| `dbr_per1k` | `0.008` | expected doublet rate per 1k cells |
+| `stringency` | `0.5` | threshold optimisation aggressiveness |
+| `random_state` | `42` | reproducibility seed |
+| `use_gpu` | `False` | enable GPU-accelerated steps (requires rapids/cuml) |
+| `verbose` | `True` | print progress at each stage |
+
+## Running the benchmarks
+
+The benchmark scripts live in `benchmarking/` and must be run from **inside
+that directory** so that relative dataset paths resolve correctly.
+
+**Run all datasets:**
+
+```bash
+cd benchmarking
+python run_python_benchmark.py
+```
+
+Results are saved to `benchmarking/python_benchmark_metrics.csv`.
+
+**Run a single dataset** (e.g. `hm-6k`):
+
+```bash
+cd benchmarking
+python run_dataset.py hm-6k
+# optionally pass a repeat count: python run_dataset.py hm-6k 3
+```
+
+Results are saved to `benchmarking/python_benchmark_hm-6k.csv`.
+
+Datasets must be present as `benchmarking/datasets/<name>.h5ad` and must
+contain a `truth` column in `adata.obs` with values `doublet` / `singlet`.
 
 ## Reproducibility tips
 
@@ -152,18 +187,20 @@ Commonly tuned parameters:
 - Keep package versions stable (especially `scanpy`, `scikit-learn`, `xgboost`).
 - Use the same preprocessing assumptions (counts in `adata.X` or `adata.layers['counts']`).
 
-## Current scope and notes
+## Notes and current limitations
 
-- This is a Python implementation inspired by the R package behavior.
-- Some low-level differences can remain due to backend/library differences.
-- `samples_col` is currently accepted but ignored in the Python pipeline.
+- `samples_col` is accepted but currently ignored in the Python pipeline.
+- Some low-level numerical differences from the R package are expected due to
+  library backend differences.
 
-## Minimal troubleshooting
+## Troubleshooting
 
-If results look unstable or unexpectedly weak:
-- confirm counts are raw counts (not already transformed) where expected
-- try both modes (`clusters_col=None` and clustered mode)
-- verify `xgboost` installation and version
-- run with `verbose=True` to inspect each stage
+**Results look unstable or weak:**
+- Confirm counts are raw (not log-normalised or otherwise transformed).
+- Try both modes (`clusters_col=None` and a clustered mode).
+- Check `xgboost` version is compatible with your Python version.
+- Run with `verbose=True` to inspect each stage.
 
-If clustering looks poor, test with your own precomputed clusters and pass them via `clusters_col`.
+**Clustering looks poor:**
+- Pass your own precomputed cluster labels via `clusters_col` instead of relying
+  on the built-in fast clustering.
