@@ -69,5 +69,4 @@ p1 <- ggplot(e, aes(dataset, method)) +
         axis.title.y=element_blank(), panel.grid=element_blank())
 
 ggsave("benchmark_AUPRC_fig.png", p1, width=10.5, height=6.8, dpi=300)
-ggsave("benchmark_AUPRC_fig.pdf", p1, width=10.5, height=6.8)
 cat("Plot generated successfully!\n")
