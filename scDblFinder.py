@@ -451,7 +451,8 @@ def compute_doublet_score(
         # Align with R's defaultKnnKs kmax heuristic.
         n_neighbors = max(int(np.ceil(np.sqrt(n_cells / 2.0))), 25)
         
-    knn_features = _evaluate_knn(adata_combined, n_neighbors=n_neighbors, use_gpu=use_gpu)
+    knn_features = _evaluate_knn(adata_combined, n_neighbors=n_neighbors,
+                                 use_gpu=use_gpu, random_state=random_state)
     
     # Add features to obs
     for col, values in knn_features.items():
@@ -885,7 +886,7 @@ def compute_doublet_score(
     return adata_orig
 
 
-def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
+def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
     """
     Calculates KNN-based features for doublet detection.
     
@@ -905,35 +906,61 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
     # We need to map string origins to integers for efficient processing or use arrays?
     origins = adata.obs['most_likely_origin'].values.copy()
     
-    # Train KNN.
-    # Use sklearn's KNN to get candidate neighbors, then enforce deterministic
-    # tie-breaking and explicit self-neighbor ordering to match BiocNeighbors::findKNN
-    nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', n_jobs=-1).fit(X_pca)
-    distances, indices = nbrs.kneighbors(X_pca)
+    # Train KNN using pynndescent (approximate, matching R's BiocNeighbors::AnnoyParam).
+    # Falls back to sklearn exact search if pynndescent is unavailable.
+    _knn_done = False
+    try:
+        import warnings as _warnings
+        from pynndescent import NNDescent
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            _nn_index = NNDescent(X_pca, n_neighbors=n_neighbors,
+                                  metric='euclidean', random_state=random_state)
+        indices, distances = _nn_index.neighbor_graph
+        indices = np.asarray(indices, dtype=int).copy()
+        distances = np.asarray(distances, dtype=float).copy()
+        _knn_done = True
+    except ImportError:
+        pass
+
+    if not _knn_done:
+        nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', n_jobs=-1).fit(X_pca)
+        distances, indices = nbrs.kneighbors(X_pca)
 
     n_obs = X_pca.shape[0]
+    _rows = np.arange(n_obs)
 
-    # Enforce deterministic ordering: sort neighbors by (distance, index)
-    # so ties on distance are broken consistently by index order (ascending).
-    for i in range(n_obs):
-        row_d = distances[i]
-        row_idx = indices[i]
-        # lexsort takes keys with the last key as primary; provide (row_idx, row_d)
-        order = np.lexsort((row_idx, row_d))
-        distances[i] = row_d[order]
-        indices[i] = row_idx[order]
-        # Ensure self is present and placed first. If missing, insert self with zero
-        # distance and drop the last neighbor to keep count stable.
-        self_pos = np.where(indices[i] == i)[0]
-        if self_pos.size > 0:
-            if self_pos[0] != 0:
-                pos = int(self_pos[0])
-                indices[i] = np.concatenate(([indices[i][pos]], np.delete(indices[i], pos)))
-                distances[i] = np.concatenate(([distances[i][pos]], np.delete(distances[i], pos)))
-        else:
-            # prepend self
-            indices[i] = np.concatenate(([i], indices[i][:-1]))
-            distances[i] = np.concatenate(([0.0], distances[i][:-1]))
+    # Enforce deterministic ordering: sort neighbors by (distance, index) using
+    # two-pass stable argsort (equivalent to np.lexsort((indices, distances)) per row).
+    _o1       = np.argsort(indices,   axis=1, kind='stable')
+    distances = np.take_along_axis(distances, _o1, axis=1)
+    indices   = np.take_along_axis(indices,   _o1, axis=1)
+    _o2       = np.argsort(distances, axis=1, kind='stable')
+    distances = np.take_along_axis(distances, _o2, axis=1)
+    indices   = np.take_along_axis(indices,   _o2, axis=1)
+
+    # Ensure self is present and placed first.
+    _self_mask = (indices == _rows[:, None])
+    _self_pos  = np.argmax(_self_mask, axis=1)
+    _has_self  = _self_mask.any(axis=1)
+
+    # Move first self to position 0 for rows where self is present but misplaced.
+    _move = _has_self & (_self_pos != 0)
+    if _move.any():
+        _first_self = _self_mask & (_self_mask.cumsum(axis=1) == 1)
+        _sort_key   = np.where(_first_self, -1, np.arange(n_neighbors)[None, :])
+        _o3 = np.argsort(_sort_key, axis=1, kind='stable')
+        distances[_move] = np.take_along_axis(distances[_move], _o3[_move], axis=1)
+        indices[_move]   = np.take_along_axis(indices[_move],   _o3[_move], axis=1)
+
+    # Inject self at position 0 for rows where self is absent (shift right, drop last).
+    _no_self = ~_has_self
+    if _no_self.any():
+        _r = np.where(_no_self)[0]
+        indices[_r,   1:] = indices[_r,   :-1].copy()
+        distances[_r, 1:] = distances[_r, :-1].copy()
+        indices[_r,   0]  = _r
+        distances[_r, 0]  = 0.
 
     # 1. Distance to nearest.
     # R stores the first neighbor distance (after replacing self-distance 0s).
@@ -1030,50 +1057,34 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
         final_origins = np.full(n_obs, -1, dtype=int)
         origin_ambiguous = np.full(n_obs, False, dtype=bool)
 
-        for i in range(n_obs):
-            row = neighbor_origins_num[i]
-            valid_neighbors = row[row >= 0]
-            if len(valid_neighbors) == 0:
-                final_origins[i] = -1
-                origin_ambiguous[i] = False
-                continue
-            # counts per origin
-            vals, counts = np.unique(valid_neighbors, return_counts=True)
-            if len(vals) == 1:
-                final_origins[i] = vals[0]
-                origin_ambiguous[i] = False
-                continue
-            # check unique max
-            max_count = counts.max()
-            if np.sum(counts == max_count) == 1:
-                final_origins[i] = vals[np.argmax(counts)]
-                origin_ambiguous[i] = False
-                continue
-            # tie: compute min distance per origin among neighbors
-            origin_mins = []
-            origin_names = []
-            for v in vals:
-                mask = (neighbor_origins_num[i] == v)
-                if np.any(mask):
-                    min_dist = distances[i][mask].min()
-                else:
-                    min_dist = np.inf
-                origin_mins.append(min_dist)
-                origin_names.append(v)
-            origin_mins = np.array(origin_mins)
-            order = np.argsort(origin_mins)
-            if origin_mins[order].size >= 2:
-                x1 = origin_mins[order][0]
-                x2 = origin_mins[order][1]
-                if x1 <= 0:
-                    ambiguous = True
-                else:
-                    ambiguous = not ((x2 - x1) / x1 > 0.2)
-                final_origins[i] = origin_names[order[0]]
-                origin_ambiguous[i] = ambiguous
-            else:
-                final_origins[i] = origin_names[order[0]]
-                origin_ambiguous[i] = False
+        # Vectorized: count votes per origin for each cell.
+        _cnt = np.zeros((n_obs, n_origins), dtype=np.int32)
+        for _j in range(n_origins):
+            _cnt[:, _j] = (neighbor_origins_num == _j).sum(axis=1)
+
+        _no_valid  = (neighbor_origins_num >= 0).sum(axis=1) == 0
+        _mx_cnt    = _cnt.max(axis=1)
+        _best_org  = np.argmax(_cnt, axis=1)
+        _n_at_mx   = (_cnt == _mx_cnt[:, None]).sum(axis=1)
+
+        _unique_max = (_n_at_mx == 1) & ~_no_valid
+        final_origins[_unique_max]    = _best_org[_unique_max]
+        origin_ambiguous[_unique_max] = False
+
+        # Tie rows: R's min-distance tie-breaking logic.
+        for i in np.where((_n_at_mx > 1) & ~_no_valid)[0]:
+            _row       = neighbor_origins_num[i]
+            _tied_vals = np.where(_cnt[i] == _mx_cnt[i])[0]
+            _mins      = np.array([
+                distances[i][_row == v].min() if (_row == v).any() else np.inf
+                for v in _tied_vals
+            ])
+            _ord = np.argsort(_mins)
+            x1   = _mins[_ord[0]]
+            x2   = _mins[_ord[1]] if len(_ord) >= 2 else np.inf
+            ambiguous = (x1 <= 0) or not ((x2 - x1) / x1 > 0.2)
+            final_origins[i]    = _tied_vals[_ord[0]]
+            origin_ambiguous[i] = ambiguous
 
         most_likely_str = np.array([rev_origin_map[i] if i >= 0 else np.nan for i in final_origins], dtype=object)
         
@@ -1108,29 +1119,13 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False):
         difficulty[valid_means] = 1.0 - mapped_means[valid_means]
 
     
-    # 5. Dist to nearest Real / Doublet
-    # R computes the first nearest neighbor of the opposite type, not the minimum
-    # over all matching neighbors.
-    max_dist = distances[:, 0].max() * 2
-    dist_to_nearest_real = np.empty(n_obs, dtype=float)
-    dist_to_nearest_doublet = np.empty(n_obs, dtype=float)
-    for idx in range(n_obs):
-        row_types = neighbor_types[idx]
-        row_dist = distances[idx]
-        dbl_hits = np.where(row_types == 1)[0]
-        real_hits = np.where(row_types == 0)[0]
-        # pick the nearest neighbor of the requested type but ignore self (rank 0)
-        def first_nonself(hits):
-            if hits.size == 0:
-                return None
-            if hits[0] == 0:
-                return hits[1] if hits.size > 1 else None
-            return hits[0]
-
-        di = first_nonself(dbl_hits)
-        ri = first_nonself(real_hits)
-        dist_to_nearest_doublet[idx] = row_dist[di] if di is not None else max_dist
-        dist_to_nearest_real[idx] = row_dist[ri] if ri is not None else max_dist
+    # 5. Dist to nearest Real / Doublet (vectorized: skip self at position 0)
+    max_dist    = distances[:, 0].max() * 2
+    _col0_mask  = (np.arange(n_neighbors)[None, :] == 0)
+    _d_real     = np.where((neighbor_types == 0) & ~_col0_mask, distances, max_dist)
+    _d_dbl      = np.where((neighbor_types == 1) & ~_col0_mask, distances, max_dist)
+    dist_to_nearest_real    = _d_real.min(axis=1)
+    dist_to_nearest_doublet = _d_dbl.min(axis=1)
 
     # 6. Count of counts > 2, matching R's nAbove2
     counts_matrix = adata.layers['counts'] if 'counts' in adata.layers else adata.X
