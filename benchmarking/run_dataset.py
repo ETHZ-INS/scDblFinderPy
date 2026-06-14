@@ -24,7 +24,7 @@ def eval_mode(adata, mode_name, clusters_col, ds_name, n_repeats=1, use_gpu=Fals
                 random_state=42,
                 n_iters=3,
                 clusters_col=clusters_col,
-                n_features=1000 if ds_name.startswith("pbmc") else 1352,
+                n_features=1000,
                 use_gpu=use_gpu,
             )
         except NotImplementedError as e:
@@ -64,7 +64,7 @@ def main():
     use_gpu = '--gpu' in remaining
     remaining = [a for a in remaining if a != '--gpu']
     n_repeats = int(remaining[0]) if remaining else 1
-    n_features = 1000 if ds_name.startswith('pbmc') else 1352
+    n_features = 1000
     ds_path = f"datasets/{ds_name}.h5ad"
     if not os.path.exists(ds_path):
         print(f"Dataset {ds_path} not found.")

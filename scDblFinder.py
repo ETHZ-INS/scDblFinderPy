@@ -496,7 +496,27 @@ def compute_doublet_score(
         raise ValueError('No ratio_doublets_* features were generated for the initial score')
     ratio_feature = ratio_feature_cols[-1]
     ratio_vals = adata_combined.obs[ratio_feature].values
-    scores = (adata_combined.obs['cxds_score'].values + ratio_vals / max(np.max(ratio_vals), 1e-12)) / 2.0
+    cxds_vals = adata_combined.obs['cxds_score'].values
+
+    if clusters is None:
+        # Random mode: subtract the global artificial-cell fraction from the ratio
+        # before normalising. Without this, when artificials make up ~44 % of the
+        # combined pool (e.g. hm-12k: 9600 / 21600), intra-species doublets that
+        # land in the real-cell cluster carry ratio ≈ 0.29; dividing by
+        # max(ratio) ≈ 0.88 gives 0.33, pushing their initial score above the 0.2
+        # unident_th and preventing w2 from excluding them. Background-subtracting
+        # centres the ratio on the global baseline so those doublets score ≈ 0 and
+        # cleanly qualify for w2 exclusion every iteration.
+        # This adjustment is only needed in random mode — in clustered mode w2
+        # never fires (unident_th=0) and changing the initial score would perturb
+        # the w1 real-doublet exclusion that clustered mode relies on.
+        n_art_init = int((adata_combined.obs['type'] == 'artificial').sum())
+        bg_ratio = n_art_init / max(adata_combined.n_obs, 1)
+        adj_ratio = np.maximum(ratio_vals - bg_ratio, 0.0)
+        adj_max = float(np.max(adj_ratio))
+        scores = (cxds_vals + (adj_ratio / adj_max if adj_max > 1e-12 else adj_ratio)) / 2.0
+    else:
+        scores = (cxds_vals + ratio_vals / max(float(np.max(ratio_vals)), 1e-12)) / 2.0
     adata_combined.obs['scDblFinder_score'] = scores
 
     # Match .scDblscore default handling when dbr.sd is not provided.
@@ -528,7 +548,10 @@ def compute_doublet_score(
             'weighted_density',
             'distance_to_nearest_real',
             *ratio_cols,
-            'difficulty',
+            # R never creates a 'difficulty' column when clusters=NULL (random mode),
+            # so exclude it here to match that behaviour. In clustered mode it is
+            # computed per-origin and is genuinely informative.
+            *(['difficulty'] if clusters is not None else []),
             'total_counts',
             'n_features',
             'nAbove2',
@@ -889,49 +912,41 @@ def compute_doublet_score(
 def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
     """
     Calculates KNN-based features for doublet detection.
-    
-    Features:
-    - distance_to_nearest (distance to kth neighbor)
-    - weighted_doublet_density
-    - ratio_doublets_k (ratio of artificial doublets in neighborhood)
-    - difficulty (based on most likely origin)
+
+    Mirrors R's .evaluateKNN: all features are computed on k TRUE non-self
+    neighbors, matching BiocNeighbors::findKNN which excludes the query point.
     """
     X_pca = adata.obsm['X_pca']
-    y_type = (adata.obs['type'] == 'artificial').values.astype(int) # 0=Real, 1=Artificial
-    
-    # Origins tracking
-    # Get origins from obs. 
-    # Artificial cells have known origin (e.g. 'ClusterA+ClusterB'). Real cells have NaN.
-    
-    # We need to map string origins to integers for efficient processing or use arrays?
+    y_type = (adata.obs['type'] == 'artificial').values.astype(int)  # 0=real, 1=artificial
     origins = adata.obs['most_likely_origin'].values.copy()
-    
-    # Train KNN using pynndescent (approximate, matching R's BiocNeighbors::AnnoyParam).
-    # Falls back to sklearn exact search if pynndescent is unavailable.
+
+    n_obs = X_pca.shape[0]
+
+    # Request n_neighbors + 1 so that after stripping the query point (which both
+    # sklearn and pynndescent include at distance 0) we are left with exactly
+    # n_neighbors true non-self neighbors — matching R's findKNN behaviour.
+    _n_query = n_neighbors + 1
+
     _knn_done = False
     try:
         import warnings as _warnings
         from pynndescent import NNDescent
         with _warnings.catch_warnings():
             _warnings.simplefilter("ignore")
-            _nn_index = NNDescent(X_pca, n_neighbors=n_neighbors,
+            _nn_index = NNDescent(X_pca, n_neighbors=_n_query,
                                   metric='euclidean', random_state=random_state)
         indices, distances = _nn_index.neighbor_graph
-        indices = np.asarray(indices, dtype=int).copy()
+        indices   = np.asarray(indices,   dtype=int).copy()
         distances = np.asarray(distances, dtype=float).copy()
         _knn_done = True
     except ImportError:
         pass
 
     if not _knn_done:
-        nbrs = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', n_jobs=-1).fit(X_pca)
+        nbrs = NearestNeighbors(n_neighbors=_n_query, algorithm='auto', n_jobs=-1).fit(X_pca)
         distances, indices = nbrs.kneighbors(X_pca)
 
-    n_obs = X_pca.shape[0]
-    _rows = np.arange(n_obs)
-
-    # Enforce deterministic ordering: sort neighbors by (distance, index) using
-    # two-pass stable argsort (equivalent to np.lexsort((indices, distances)) per row).
+    # Sort each row by (distance, index) for deterministic tie-breaking.
     _o1       = np.argsort(indices,   axis=1, kind='stable')
     distances = np.take_along_axis(distances, _o1, axis=1)
     indices   = np.take_along_axis(indices,   _o1, axis=1)
@@ -939,130 +954,89 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
     distances = np.take_along_axis(distances, _o2, axis=1)
     indices   = np.take_along_axis(indices,   _o2, axis=1)
 
-    # Ensure self is present and placed first.
-    _self_mask = (indices == _rows[:, None])
-    _self_pos  = np.argmax(_self_mask, axis=1)
-    _has_self  = _self_mask.any(axis=1)
+    # Strip the query point (self) from every row, then keep n_neighbors entries.
+    # Self appears at distance 0; after distance-sorting it is at column 0.
+    # We check explicitly to handle any edge case where self might not be present.
+    _rows      = np.arange(n_obs)
+    _self_mask = (indices == _rows[:, None])   # (n_obs, n_query)
 
-    # Move first self to position 0 for rows where self is present but misplaced.
-    _move = _has_self & (_self_pos != 0)
-    if _move.any():
-        _first_self = _self_mask & (_self_mask.cumsum(axis=1) == 1)
-        _sort_key   = np.where(_first_self, -1, np.arange(n_neighbors)[None, :])
-        _o3 = np.argsort(_sort_key, axis=1, kind='stable')
-        distances[_move] = np.take_along_axis(distances[_move], _o3[_move], axis=1)
-        indices[_move]   = np.take_along_axis(indices[_move],   _o3[_move], axis=1)
+    clean_idx  = np.empty((n_obs, n_neighbors), dtype=int)
+    clean_dist = np.empty((n_obs, n_neighbors), dtype=float)
 
-    # Inject self at position 0 for rows where self is absent (shift right, drop last).
-    _no_self = ~_has_self
-    if _no_self.any():
-        _r = np.where(_no_self)[0]
-        indices[_r,   1:] = indices[_r,   :-1].copy()
-        distances[_r, 1:] = distances[_r, :-1].copy()
-        indices[_r,   0]  = _r
-        distances[_r, 0]  = 0.
+    # Vectorised path: if self is always at column 0 (the common case), slice columns 1:
+    if _self_mask[:, 0].all():
+        clean_idx  = indices[:, 1:n_neighbors + 1]
+        clean_dist = distances[:, 1:n_neighbors + 1]
+    else:
+        # Fallback: per-row removal for rows where self is not at column 0.
+        clean_idx  = indices[:, 1:n_neighbors + 1].copy()
+        clean_dist = distances[:, 1:n_neighbors + 1].copy()
+        for i in np.where(~_self_mask[:, 0])[0]:
+            sp_arr = np.where(_self_mask[i])[0]
+            if sp_arr.size > 0:
+                sp_pos = sp_arr[0]
+                row_i  = np.delete(indices[i],   sp_pos)[:n_neighbors]
+                row_d  = np.delete(distances[i], sp_pos)[:n_neighbors]
+            else:
+                row_i  = indices[i, :n_neighbors]
+                row_d  = distances[i, :n_neighbors]
+            clean_idx[i]  = row_i
+            clean_dist[i] = row_d
 
-    # 1. Distance to nearest.
-    # R stores the first neighbor distance (after replacing self-distance 0s).
+    indices   = clean_idx
+    distances = clean_dist
+    # distances[:, 0] is now the distance to the true nearest non-self neighbor.
+
+    # 1. Distance to nearest (true nearest non-self neighbor, matching R's distanceToNearest).
     dist_to_k = distances[:, 0].copy()
+    # Replace any accidental zeros (identical cells) with the global minimum positive distance.
     if np.any(dist_to_k == 0):
-        positive_first = dist_to_k[dist_to_k > 0]
-        if positive_first.size > 0:
-            dist_to_k[dist_to_k == 0] = positive_first.min()
-        else:
-            dist_to_k[dist_to_k == 0] = 1e-6
-    
-    # 2. Ratio of doublets in neighborhood
-    # indices is (n_obs, n_neighbors)
-    # Retrieve types of neighbors
-    neighbor_types = y_type[indices] # (n_obs, n_neighbors)
-    
-    # Ratio at multiple k
+        pos = dist_to_k[dist_to_k > 0]
+        dist_to_k[dist_to_k == 0] = pos.min() if pos.size > 0 else 1e-6
+
+    # 2. Ratio of artificial doublets in neighborhood at multiple k values.
+    neighbor_types = y_type[indices]  # (n_obs, n_neighbors) — no self
     ratio_dict = {}
     k_vals = np.sort(np.unique([k for k in [3, 10, 15, 20, 25, 50, n_neighbors] if k <= n_neighbors]))
     for ki in k_vals:
         ratio_dict[f'ratio_doublets_{ki}'] = np.mean(neighbor_types[:, :ki], axis=1)
-    
-    # 3. Weighted density
-    # R: dw <- sqrt(k - seq_len(k)) * 1/dist
-    # Python: weights based on rank/distance
-    
-    # Check for zero dists, matching the R code that replaces any 0 in the first
-    # nearest-neighbor distance column with the smallest positive first-neighbor distance.
-    SAFE_DIST = distances.copy()
-    first_col = SAFE_DIST[:, 0]
-    min_gt_0 = first_col[first_col > 0].min() if (first_col > 0).any() else 1e-6
-    SAFE_DIST[SAFE_DIST == 0] = min_gt_0
 
-    ranks = np.arange(1, n_neighbors + 1)
-    rank_weights = np.sqrt(n_neighbors - ranks)  # Shape (n_neighbors,)
-    
-    # Distance weighting: 1 / distance
+    # 3. Weighted density — mirrors R's dw = sqrt(k - seq_len(k)) * 1/dist.
+    # With self removed, distances[:, 0] is the true nearest neighbor distance.
+    # R replaces any zero in the first-neighbor column before computing weights.
+    SAFE_DIST = distances.copy()
+    _first_pos = SAFE_DIST[:, 0]
+    _min_pos   = _first_pos[_first_pos > 0].min() if (_first_pos > 0).any() else 1e-6
+    SAFE_DIST[SAFE_DIST == 0] = _min_pos
+
+    # rank_weights: sqrt(k-1), sqrt(k-2), ..., 0  (matching R's sqrt(k - seq_len(k)))
+    ranks        = np.arange(1, n_neighbors + 1)
+    rank_weights = np.sqrt(n_neighbors - ranks)
     dist_weights = 1.0 / SAFE_DIST
-    
-    # Combined weights
-    weights = rank_weights * dist_weights
-    
-    # Normalize rows
-    row_sums = weights.sum(axis=1, keepdims=True)
-    norm_weights = weights / row_sums
-    
+    weights      = rank_weights * dist_weights
+    row_sums     = weights.sum(axis=1, keepdims=True)
+    norm_weights = weights / np.where(row_sums == 0, 1.0, row_sums)
     weighted_score = np.sum(neighbor_types * norm_weights, axis=1)
 
-    # 4. Most Likely Origin & Difficulty
-    # R: origins determined by looking at neighbors' origins.
-    # Real cells get origin assigned based on frequent neighbors.
-    
-    # Retrieve neighbor origins
-    # neighbor_origins (N x k). Contains strings or NaNs.
-    neighbor_origins = origins[indices]
-    
-    # For each cell, determine most frequent origin among neighbors
-    # Ignore NaNs (real neighbors)
-    
-    most_likely = []
-    
-    # This loop is slow in Python for large N. Optimize?
-    # Vectorized approach hard with strings.
-    # Map unique origins to ints.
-    
-    unique_origins = pd.unique(origins[~pd.isnull(origins)])
-    origin_map = {o: i for i, o in enumerate(unique_origins)}
-    rev_origin_map = {i: o for i, o in enumerate(unique_origins)}
-    n_origins = len(unique_origins)
-    
-    # default values when there are no origins
+    # 4. Most likely origin & difficulty (unchanged logic, now using clean indices).
+    unique_origins  = pd.unique(origins[~pd.isnull(origins)])
+    origin_map      = {o: i for i, o in enumerate(unique_origins)}
+    rev_origin_map  = {i: o for i, o in enumerate(unique_origins)}
+    n_origins       = len(unique_origins)
+
     origin_ambiguous = np.full(n_obs, False, dtype=bool)
-    final_origins = np.full(n_obs, -1, dtype=int)
+    final_origins    = np.full(n_obs, -1,    dtype=int)
 
     if n_origins > 0:
-        # Convert origins to numeric, -1 for NaN
-        origins_num = np.full(len(origins), -1, dtype=int)
-        valid_mask = ~pd.isnull(origins)
-        # Use pandas map is faster?
-        # origins_num[valid_mask] = [origin_map[o] for o in origins[valid_mask]] # List comp slow
-        # Series map
-        
-        s_origins = pd.Series(origins)
-        # Map known
-        mapped = s_origins.map(origin_map).fillna(-1).astype(int).values
-        origins_num = mapped
-        
-        neighbor_origins_num = origins_num[indices] # (N x k)
+        s_origins        = pd.Series(origins)
+        origins_num      = s_origins.map(origin_map).fillna(-1).astype(int).values
+        neighbor_orig_num = origins_num[indices]  # (n_obs, n_neighbors)
 
-        # Implement R's .getMostLikelyOrigins tie-breaking logic.
-        # For each cell: if all NA -> (NA, NA); else if only one origin -> (that, FALSE)
-        # else if unique max -> (that, FALSE). If tie, compare min distances per origin
-        # and check whether (x2 - x1) / x1 > 0.2 to mark unambiguous.
-        final_origins = np.full(n_obs, -1, dtype=int)
-        origin_ambiguous = np.full(n_obs, False, dtype=bool)
-
-        # Vectorized: count votes per origin for each cell.
-        _cnt = np.zeros((n_obs, n_origins), dtype=np.int32)
+        _cnt      = np.zeros((n_obs, n_origins), dtype=np.int32)
         for _j in range(n_origins):
-            _cnt[:, _j] = (neighbor_origins_num == _j).sum(axis=1)
+            _cnt[:, _j] = (neighbor_orig_num == _j).sum(axis=1)
 
-        _no_valid  = (neighbor_origins_num >= 0).sum(axis=1) == 0
+        _no_valid  = (neighbor_orig_num >= 0).sum(axis=1) == 0
         _mx_cnt    = _cnt.max(axis=1)
         _best_org  = np.argmax(_cnt, axis=1)
         _n_at_mx   = (_cnt == _mx_cnt[:, None]).sum(axis=1)
@@ -1071,63 +1045,41 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
         final_origins[_unique_max]    = _best_org[_unique_max]
         origin_ambiguous[_unique_max] = False
 
-        # Tie rows: R's min-distance tie-breaking logic.
         for i in np.where((_n_at_mx > 1) & ~_no_valid)[0]:
-            _row       = neighbor_origins_num[i]
+            _row       = neighbor_orig_num[i]
             _tied_vals = np.where(_cnt[i] == _mx_cnt[i])[0]
             _mins      = np.array([
                 distances[i][_row == v].min() if (_row == v).any() else np.inf
                 for v in _tied_vals
             ])
-            _ord = np.argsort(_mins)
-            x1   = _mins[_ord[0]]
-            x2   = _mins[_ord[1]] if len(_ord) >= 2 else np.inf
+            _ord      = np.argsort(_mins)
+            x1        = _mins[_ord[0]]
+            x2        = _mins[_ord[1]] if len(_ord) >= 2 else np.inf
             ambiguous = (x1 <= 0) or not ((x2 - x1) / x1 > 0.2)
             final_origins[i]    = _tied_vals[_ord[0]]
             origin_ambiguous[i] = ambiguous
 
-        most_likely_str = np.array([rev_origin_map[i] if i >= 0 else np.nan for i in final_origins], dtype=object)
-        
+        most_likely_str = np.array(
+            [rev_origin_map[i] if i >= 0 else np.nan for i in final_origins], dtype=object
+        )
     else:
         most_likely_str = np.full(n_obs, np.nan, dtype=object)
-        
-    # Difficulty Feature
-    # R: class.weighted <- mean(weighted[type=="doublet"]) per origin
-    # D$difficulty[w] <- 1 - class.weighted[origin]
-    
+
     difficulty = np.ones(n_obs, dtype=float)
-    
     if n_origins > 0:
-        # Compute mean weighted score per origin (using only artificial doublets)
-        df = pd.DataFrame({'origin': origins, 'weighted': weighted_score, 'type': y_type})
-        
-        # Filter for artificial doublets
-        df_art = df[df['type'] == 1]
-        
-        # Groupby origin
+        df_art       = pd.DataFrame({'origin': origins, 'weighted': weighted_score, 'type': y_type})
+        df_art       = df_art[df_art['type'] == 1]
         origin_means = df_art.groupby('origin')['weighted'].mean()
-        
-        # Map means to all cells based on most_likely_str
-        # If most_likely_str is NaN, difficulty remains 1? 
-        # R: d$difficulty <- 1; d$difficulty[w] <- 1 - class.weighted...
-        
-        # Map
         mapped_means = origin_means.reindex(most_likely_str).values
-        
-        # Where mapped_means is valid (not NaN), update difficulty
-        valid_means = ~np.isnan(mapped_means)
+        valid_means  = ~np.isnan(mapped_means)
         difficulty[valid_means] = 1.0 - mapped_means[valid_means]
 
-    
-    # 5. Dist to nearest Real / Doublet (vectorized: skip self at position 0)
-    max_dist    = distances[:, 0].max() * 2
-    _col0_mask  = (np.arange(n_neighbors)[None, :] == 0)
-    _d_real     = np.where((neighbor_types == 0) & ~_col0_mask, distances, max_dist)
-    _d_dbl      = np.where((neighbor_types == 1) & ~_col0_mask, distances, max_dist)
-    dist_to_nearest_real    = _d_real.min(axis=1)
-    dist_to_nearest_doublet = _d_dbl.min(axis=1)
+    # 5. Distance to nearest real / doublet neighbor (self already absent).
+    max_dist                = distances[:, -1].max() * 2
+    dist_to_nearest_real    = np.where(neighbor_types == 0, distances, max_dist).min(axis=1)
+    dist_to_nearest_doublet = np.where(neighbor_types == 1, distances, max_dist).min(axis=1)
 
-    # 6. Count of counts > 2, matching R's nAbove2
+    # 6. nAbove2: count of genes with counts > 2 (raw counts, not KNN-derived).
     counts_matrix = adata.layers['counts'] if 'counts' in adata.layers else adata.X
     if sp.issparse(counts_matrix):
         n_above2 = np.asarray((counts_matrix > 2).sum(axis=1)).ravel()
@@ -1135,7 +1087,7 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
         n_above2 = np.sum(counts_matrix > 2, axis=1)
 
     res = {
-        'distance_to_nearest': dist_to_k, # Keep for debug but exclude from features later
+        'distance_to_nearest': dist_to_k,
         'weighted_density': weighted_score,
         'distance_to_nearest_real': dist_to_nearest_real,
         'distance_to_nearest_doublet': dist_to_nearest_doublet,
@@ -1145,9 +1097,8 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
         'origin_ambiguous': origin_ambiguous,
     }
     res.update(ratio_dict)
-    # Persist raw knn indices/distances for debugging/trace parity comparisons
     try:
-        adata.obsm['knn_indices'] = indices
+        adata.obsm['knn_indices']   = indices
         adata.obsm['knn_distances'] = distances
     except Exception:
         pass

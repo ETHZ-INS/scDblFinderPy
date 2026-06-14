@@ -9,44 +9,30 @@ from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from pyscDblFinder.scDblFinder import compute_doublet_score
 
-def eval_mode(adata, mode_name, clusters_col, ds_name, n_repeats=3, use_gpu=False):
-    aurocs = []
-    auprcs = []
-    elapsed_times = []
-
-    for i in range(n_repeats):
-        st = time.time()
-        try:
-            # Use the same seed on every repeat so reruns are exactly reproducible.
-            adata_res = compute_doublet_score(adata.copy(), n_iters=3, random_state=42,
-                                              clusters_col=clusters_col, use_gpu=use_gpu)
-        except Exception as e:
-            print(f"    Failed on {mode_name} for {ds_name} (repeat {i}): {e}")
-            continue
-
-        elapsed = time.time() - st
-        
-        truth_labels = (adata_res.obs['truth'] == 'doublet').astype(int)
-        scores = adata_res.obs['scDblFinder_score']
-        
-        auroc = roc_auc_score(truth_labels, scores)
-        
-        precision, recall, _ = precision_recall_curve(truth_labels, scores)
-        auprc = auc(recall, precision)
-        
-        aurocs.append(auroc)
-        auprcs.append(auprc)
-        elapsed_times.append(elapsed)
-        
-    if not aurocs:
+def eval_mode(adata, mode_name, clusters_col, ds_name, use_gpu=False):
+    st = time.time()
+    try:
+        adata_res = compute_doublet_score(adata.copy(), n_iters=3, random_state=42,
+                                          clusters_col=clusters_col, use_gpu=use_gpu)
+    except Exception as e:
+        print(f"    Failed on {mode_name} for {ds_name}: {e}")
         return None
-        
+
+    elapsed = time.time() - st
+
+    truth_labels = (adata_res.obs['truth'] == 'doublet').astype(int)
+    scores = adata_res.obs['scDblFinder_score']
+
+    auroc = roc_auc_score(truth_labels, scores)
+    precision, recall, _ = precision_recall_curve(truth_labels, scores)
+    auprc = auc(recall, precision)
+
     return {
         "dataset": ds_name,
         "method": mode_name,
-        "AUPRC": sum(auprcs) / len(auprcs),
-        "AUROC": sum(aurocs) / len(aurocs),
-        "elapsed": sum(elapsed_times) / len(elapsed_times)
+        "AUPRC": auprc,
+        "AUROC": auroc,
+        "elapsed": elapsed
     }
 
 def main():
@@ -66,7 +52,7 @@ def main():
 
         print(f"  -> Clustered Mode")
         res_clust = eval_mode(adata, "scDblFinder.Py.clusters", "clusters", ds_name,
-                              use_gpu=use_gpu)
+                             use_gpu=use_gpu)
         if res_clust:
             all_results.append(res_clust)
 
