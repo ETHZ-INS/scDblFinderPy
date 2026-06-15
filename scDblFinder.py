@@ -61,7 +61,7 @@ def _filter_unrecognizable_doublets(d, minSize=5, minMedDiff=0.1):
 def compute_doublet_score(
     adata, 
     n_neighbors=None,
-    n_features=1352, 
+    n_features=1000, 
     n_components=20,
     artificial_doublets_ratio=1.0, # Approx ratio to n_cells or fixed number? R uses fixed formula.
     n_artificial=None,
@@ -452,7 +452,8 @@ def compute_doublet_score(
         n_neighbors = max(int(np.ceil(np.sqrt(n_cells / 2.0))), 25)
         
     knn_features = _evaluate_knn(adata_combined, n_neighbors=n_neighbors,
-                                 use_gpu=use_gpu, random_state=random_state)
+                                 use_gpu=use_gpu, random_state=random_state,
+                                 random_mode=(clusters is None))
     
     # Add features to obs
     for col, values in knn_features.items():
@@ -498,25 +499,7 @@ def compute_doublet_score(
     ratio_vals = adata_combined.obs[ratio_feature].values
     cxds_vals = adata_combined.obs['cxds_score'].values
 
-    if clusters is None:
-        # Random mode: subtract the global artificial-cell fraction from the ratio
-        # before normalising. Without this, when artificials make up ~44 % of the
-        # combined pool (e.g. hm-12k: 9600 / 21600), intra-species doublets that
-        # land in the real-cell cluster carry ratio ≈ 0.29; dividing by
-        # max(ratio) ≈ 0.88 gives 0.33, pushing their initial score above the 0.2
-        # unident_th and preventing w2 from excluding them. Background-subtracting
-        # centres the ratio on the global baseline so those doublets score ≈ 0 and
-        # cleanly qualify for w2 exclusion every iteration.
-        # This adjustment is only needed in random mode — in clustered mode w2
-        # never fires (unident_th=0) and changing the initial score would perturb
-        # the w1 real-doublet exclusion that clustered mode relies on.
-        n_art_init = int((adata_combined.obs['type'] == 'artificial').sum())
-        bg_ratio = n_art_init / max(adata_combined.n_obs, 1)
-        adj_ratio = np.maximum(ratio_vals - bg_ratio, 0.0)
-        adj_max = float(np.max(adj_ratio))
-        scores = (cxds_vals + (adj_ratio / adj_max if adj_max > 1e-12 else adj_ratio)) / 2.0
-    else:
-        scores = (cxds_vals + ratio_vals / max(float(np.max(ratio_vals)), 1e-12)) / 2.0
+    scores = (cxds_vals + ratio_vals / max(float(np.max(ratio_vals)), 1e-12)) / 2.0
     adata_combined.obs['scDblFinder_score'] = scores
 
     # Match .scDblscore default handling when dbr.sd is not provided.
@@ -909,7 +892,7 @@ def compute_doublet_score(
     return adata_orig
 
 
-def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
+def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42, random_mode=False):
     """
     Calculates KNN-based features for doublet detection.
 
@@ -927,24 +910,37 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
     # n_neighbors true non-self neighbors — matching R's findKNN behaviour.
     _n_query = n_neighbors + 1
 
-    _knn_done = False
-    try:
-        import warnings as _warnings
-        from pynndescent import NNDescent
-        with _warnings.catch_warnings():
-            _warnings.simplefilter("ignore")
-            _nn_index = NNDescent(X_pca, n_neighbors=_n_query,
-                                  metric='euclidean', random_state=random_state)
-        indices, distances = _nn_index.neighbor_graph
-        indices   = np.asarray(indices,   dtype=int).copy()
-        distances = np.asarray(distances, dtype=float).copy()
-        _knn_done = True
-    except ImportError:
-        pass
+    # In random mode, use exact KNN for datasets up to 50k combined cells.
+    # pynndescent's approximation degrades on larger datasets (e.g. hm-12k at 21k cells),
+    # causing a growing AUPRC gap vs R. Exact KNN eliminates that error.
+    # In cluster mode keep pynndescent: exact KNN changes cluster-doublet feature values
+    # in ways that hurt AUPRC on within-tissue datasets (e.g. pbmc).
+    _EXACT_KNN_THRESHOLD = 50000
 
-    if not _knn_done:
-        nbrs = NearestNeighbors(n_neighbors=_n_query, algorithm='auto', n_jobs=-1).fit(X_pca)
+    if random_mode and n_obs <= _EXACT_KNN_THRESHOLD:
+        nbrs = NearestNeighbors(n_neighbors=_n_query, algorithm='ball_tree',
+                                metric='euclidean', n_jobs=-1)
+        nbrs.fit(X_pca)
         distances, indices = nbrs.kneighbors(X_pca)
+    else:
+        _knn_done = False
+        try:
+            import warnings as _warnings
+            from pynndescent import NNDescent
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                _nn_index = NNDescent(X_pca, n_neighbors=_n_query,
+                                      metric='euclidean', random_state=random_state)
+            indices, distances = _nn_index.neighbor_graph
+            indices   = np.asarray(indices,   dtype=int).copy()
+            distances = np.asarray(distances, dtype=float).copy()
+            _knn_done = True
+        except ImportError:
+            pass
+
+        if not _knn_done:
+            nbrs = NearestNeighbors(n_neighbors=_n_query, algorithm='auto', n_jobs=-1).fit(X_pca)
+            distances, indices = nbrs.kneighbors(X_pca)
 
     # Sort each row by (distance, index) for deterministic tie-breaking.
     _o1       = np.argsort(indices,   axis=1, kind='stable')
@@ -1075,7 +1071,9 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
         difficulty[valid_means] = 1.0 - mapped_means[valid_means]
 
     # 5. Distance to nearest real / doublet neighbor (self already absent).
-    max_dist                = distances[:, -1].max() * 2
+    # Fallback for cells with no real/doublet neighbour in k: use 2 × max nearest-neighbour
+    # distance, matching R's `md <- max(knn$distance[,1]); dB <- 2*md`.
+    max_dist                = dist_to_k.max() * 2
     dist_to_nearest_real    = np.where(neighbor_types == 0, distances, max_dist).min(axis=1)
     dist_to_nearest_doublet = np.where(neighbor_types == 1, distances, max_dist).min(axis=1)
 
