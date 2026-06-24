@@ -1,4 +1,4 @@
-# pyscDblFinder
+# scDblFinderPy
 
 Python implementation of the scDblFinder workflow for doublet detection in
 single-cell RNA-seq data, designed to run on AnnData/Scanpy objects.
@@ -11,7 +11,7 @@ This module mirrors the core ideas of the R package:
 
 ## What this package does
 
-Given a count matrix in an `AnnData` object, pyscDblFinder estimates a
+Given a count matrix in an `AnnData` object, scDblFinderPy estimates a
 doublet score for each real cell and returns a final class (`doublet` or
 `singlet`).
 
@@ -25,7 +25,7 @@ At a high level, the pipeline is:
 ## Repository layout
 
 ```
-pyscDblFinder/              ← repo root (this directory is the Python package)
+scDblFinderPy/              ← repo root (this directory is the Python package)
 ├── scDblFinder.py          main pipeline — contains compute_doublet_score()
 ├── clustering.py
 ├── doublet_generation.py
@@ -46,7 +46,7 @@ pyscDblFinder/              ← repo root (this directory is the Python package)
 
 ```bash
 git clone <repo-url>
-cd pyscDblFinder
+cd scDblFinderPy
 ```
 
 ### 2. Create and activate a virtual environment
@@ -73,12 +73,12 @@ pip install rapids-singlecell cuml
 
 Because the repo root itself is the Python package, you need to add its
 **parent directory** to `sys.path` before importing. Assuming you cloned into
-`/path/to/pyscDblFinder`:
+`/path/to/scDblFinderPy`:
 
 ```python
 import sys
-sys.path.insert(0, "/path/to")   # parent of the pyscDblFinder/ directory
-from pyscDblFinder.scDblFinder import compute_doublet_score
+sys.path.insert(0, "/path/to")   # parent of the scDblFinderPy/ directory
+from scDblFinderPy.scDblFinder import compute_doublet_score
 ```
 
 ### Input expectations
@@ -93,7 +93,7 @@ from pyscDblFinder.scDblFinder import compute_doublet_score
 import scanpy as sc
 import sys
 sys.path.insert(0, "/path/to")
-from pyscDblFinder.scDblFinder import compute_doublet_score
+from scDblFinderPy.scDblFinder import compute_doublet_score
 
 adata = sc.read_h5ad("your_data.h5ad")
 adata_out = compute_doublet_score(
