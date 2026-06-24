@@ -292,7 +292,7 @@ def compute_doublet_score(
     
     art_indices = np.where(adata_combined.obs['type'] == 'artificial')[0]
     
-    scores_cxds = cxds2(adata_combined, which_dbls=art_indices, n_top=500, verbose=verbose)
+    scores_cxds = cxds2(adata_combined, which_dbls=art_indices, n_top=500, verbose=verbose, use_gpu=use_gpu)
     adata_combined.obs['cxds_score'] = scores_cxds
     
     # Library size & n_features
@@ -917,13 +917,35 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42, random_
     # in ways that hurt AUPRC on within-tissue datasets (e.g. pbmc).
     _EXACT_KNN_THRESHOLD = 50000
 
-    if random_mode and n_obs <= _EXACT_KNN_THRESHOLD:
+    _knn_done = False
+    if use_gpu and random_mode and n_obs <= _EXACT_KNN_THRESHOLD:
+        try:
+            from cuml.neighbors import NearestNeighbors as _CuNNbrs
+            _nbrs_gpu = _CuNNbrs(n_neighbors=_n_query, metric='euclidean')
+            _nbrs_gpu.fit(X_pca)
+            distances, indices = _nbrs_gpu.kneighbors(X_pca)
+            if hasattr(distances, 'to_numpy'):
+                distances = distances.to_numpy()
+            elif hasattr(distances, 'get'):
+                distances = distances.get()
+            if hasattr(indices, 'to_numpy'):
+                indices = indices.to_numpy()
+            elif hasattr(indices, 'get'):
+                indices = indices.get()
+            distances = np.asarray(distances, dtype=float)
+            indices = np.asarray(indices, dtype=int)
+            _knn_done = True
+        except Exception:
+            pass
+
+    if not _knn_done and random_mode and n_obs <= _EXACT_KNN_THRESHOLD:
         nbrs = NearestNeighbors(n_neighbors=_n_query, algorithm='ball_tree',
                                 metric='euclidean', n_jobs=-1)
         nbrs.fit(X_pca)
         distances, indices = nbrs.kneighbors(X_pca)
-    else:
-        _knn_done = False
+        _knn_done = True
+
+    if not _knn_done:
         try:
             import warnings as _warnings
             from pynndescent import NNDescent
@@ -983,36 +1005,90 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42, random_
     distances = clean_dist
     # distances[:, 0] is now the distance to the true nearest non-self neighbor.
 
-    # 1. Distance to nearest (true nearest non-self neighbor, matching R's distanceToNearest).
-    dist_to_k = distances[:, 0].copy()
-    # Replace any accidental zeros (identical cells) with the global minimum positive distance.
-    if np.any(dist_to_k == 0):
-        pos = dist_to_k[dist_to_k > 0]
-        dist_to_k[dist_to_k == 0] = pos.min() if pos.size > 0 else 1e-6
+    # Sections 1-3 and 5 are pure array ops on (n_obs, n_neighbors) matrices.
+    # CuPy is a drop-in NumPy replacement on GPU; IEEE-754 elementwise ops and
+    # reductions produce identical results. Section 4 (origins) uses pandas and
+    # Python loops so it always runs on CPU; section 6 (nAbove2) uses the sparse
+    # counts matrix and is left on CPU as well.
+    _gpu_knn_feats = False
+    if use_gpu:
+        try:
+            import cupy as cp
+            _y_g   = cp.asarray(y_type,    dtype=cp.int32)
+            _idx_g = cp.asarray(indices,   dtype=cp.int32)
+            _d_g   = cp.asarray(distances, dtype=cp.float64)
 
-    # 2. Ratio of artificial doublets in neighborhood at multiple k values.
-    neighbor_types = y_type[indices]  # (n_obs, n_neighbors) — no self
-    ratio_dict = {}
-    k_vals = np.sort(np.unique([k for k in [3, 10, 15, 20, 25, 50, n_neighbors] if k <= n_neighbors]))
-    for ki in k_vals:
-        ratio_dict[f'ratio_doublets_{ki}'] = np.mean(neighbor_types[:, :ki], axis=1)
+            # 1. dist_to_k
+            _dtk_g = _d_g[:, 0].copy()
+            if bool(cp.any(_dtk_g == 0)):
+                _pos_g = _dtk_g[_dtk_g > 0]
+                _dtk_g[_dtk_g == 0] = float(_pos_g.min()) if _pos_g.size > 0 else 1e-6
+            dist_to_k = cp.asnumpy(_dtk_g)
 
-    # 3. Weighted density — mirrors R's dw = sqrt(k - seq_len(k)) * 1/dist.
-    # With self removed, distances[:, 0] is the true nearest neighbor distance.
-    # R replaces any zero in the first-neighbor column before computing weights.
-    SAFE_DIST = distances.copy()
-    _first_pos = SAFE_DIST[:, 0]
-    _min_pos   = _first_pos[_first_pos > 0].min() if (_first_pos > 0).any() else 1e-6
-    SAFE_DIST[SAFE_DIST == 0] = _min_pos
+            # 2. ratio features
+            _nt_g  = _y_g[_idx_g]  # (n_obs, n_neighbors), int32
+            k_vals = np.sort(np.unique([k for k in [3, 10, 15, 20, 25, 50, n_neighbors] if k <= n_neighbors]))
+            ratio_dict = {}
+            for ki in k_vals:
+                ratio_dict[f'ratio_doublets_{ki}'] = cp.asnumpy(
+                    cp.mean(_nt_g[:, :ki].astype(cp.float64), axis=1)
+                )
 
-    # rank_weights: sqrt(k-1), sqrt(k-2), ..., 0  (matching R's sqrt(k - seq_len(k)))
-    ranks        = np.arange(1, n_neighbors + 1)
-    rank_weights = np.sqrt(n_neighbors - ranks)
-    dist_weights = 1.0 / SAFE_DIST
-    weights      = rank_weights * dist_weights
-    row_sums     = weights.sum(axis=1, keepdims=True)
-    norm_weights = weights / np.where(row_sums == 0, 1.0, row_sums)
-    weighted_score = np.sum(neighbor_types * norm_weights, axis=1)
+            # 3. weighted density
+            _sd_g    = _d_g.copy()
+            _fp_g    = _sd_g[:, 0]
+            _min_pos = float(_fp_g[_fp_g > 0].min()) if bool(cp.any(_fp_g > 0)) else 1e-6
+            _sd_g[_sd_g == 0] = _min_pos
+            _ranks_g = cp.arange(1, n_neighbors + 1, dtype=cp.float64)
+            _rw_g    = cp.sqrt(float(n_neighbors) - _ranks_g)
+            _dw_g    = 1.0 / _sd_g
+            _w_g     = _rw_g * _dw_g
+            _rs_g    = _w_g.sum(axis=1, keepdims=True)
+            _nw_g    = _w_g / cp.where(_rs_g == 0, 1.0, _rs_g)
+            weighted_score = cp.asnumpy(cp.sum(_nt_g.astype(cp.float64) * _nw_g, axis=1))
+
+            # 5. dist to nearest real/doublet — computed here while arrays are on GPU
+            _max_dist = float(dist_to_k.max()) * 2
+            dist_to_nearest_real    = cp.asnumpy(cp.where(_nt_g == 0, _d_g, _max_dist).min(axis=1))
+            dist_to_nearest_doublet = cp.asnumpy(cp.where(_nt_g == 1, _d_g, _max_dist).min(axis=1))
+
+            # neighbor_types as numpy is needed by section 4 (pandas / Python loops)
+            neighbor_types = cp.asnumpy(_nt_g).astype(int)
+            _gpu_knn_feats = True
+        except Exception:
+            pass
+
+    if not _gpu_knn_feats:
+        # 1. Distance to nearest (true nearest non-self neighbor, matching R's distanceToNearest).
+        dist_to_k = distances[:, 0].copy()
+        # Replace any accidental zeros (identical cells) with the global minimum positive distance.
+        if np.any(dist_to_k == 0):
+            pos = dist_to_k[dist_to_k > 0]
+            dist_to_k[dist_to_k == 0] = pos.min() if pos.size > 0 else 1e-6
+
+        # 2. Ratio of artificial doublets in neighborhood at multiple k values.
+        neighbor_types = y_type[indices]  # (n_obs, n_neighbors) — no self
+        ratio_dict = {}
+        k_vals = np.sort(np.unique([k for k in [3, 10, 15, 20, 25, 50, n_neighbors] if k <= n_neighbors]))
+        for ki in k_vals:
+            ratio_dict[f'ratio_doublets_{ki}'] = np.mean(neighbor_types[:, :ki], axis=1)
+
+        # 3. Weighted density — mirrors R's dw = sqrt(k - seq_len(k)) * 1/dist.
+        # With self removed, distances[:, 0] is the true nearest neighbor distance.
+        # R replaces any zero in the first-neighbor column before computing weights.
+        SAFE_DIST = distances.copy()
+        _first_pos = SAFE_DIST[:, 0]
+        _min_pos   = _first_pos[_first_pos > 0].min() if (_first_pos > 0).any() else 1e-6
+        SAFE_DIST[SAFE_DIST == 0] = _min_pos
+
+        # rank_weights: sqrt(k-1), sqrt(k-2), ..., 0  (matching R's sqrt(k - seq_len(k)))
+        ranks        = np.arange(1, n_neighbors + 1)
+        rank_weights = np.sqrt(n_neighbors - ranks)
+        dist_weights = 1.0 / SAFE_DIST
+        weights      = rank_weights * dist_weights
+        row_sums     = weights.sum(axis=1, keepdims=True)
+        norm_weights = weights / np.where(row_sums == 0, 1.0, row_sums)
+        weighted_score = np.sum(neighbor_types * norm_weights, axis=1)
 
     # 4. Most likely origin & difficulty (unchanged logic, now using clean indices).
     unique_origins  = pd.unique(origins[~pd.isnull(origins)])
@@ -1073,9 +1149,10 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42, random_
     # 5. Distance to nearest real / doublet neighbor (self already absent).
     # Fallback for cells with no real/doublet neighbour in k: use 2 × max nearest-neighbour
     # distance, matching R's `md <- max(knn$distance[,1]); dB <- 2*md`.
-    max_dist                = dist_to_k.max() * 2
-    dist_to_nearest_real    = np.where(neighbor_types == 0, distances, max_dist).min(axis=1)
-    dist_to_nearest_doublet = np.where(neighbor_types == 1, distances, max_dist).min(axis=1)
+    if not _gpu_knn_feats:
+        max_dist                = dist_to_k.max() * 2
+        dist_to_nearest_real    = np.where(neighbor_types == 0, distances, max_dist).min(axis=1)
+        dist_to_nearest_doublet = np.where(neighbor_types == 1, distances, max_dist).min(axis=1)
 
     # 6. nAbove2: count of genes with counts > 2 (raw counts, not KNN-derived).
     counts_matrix = adata.layers['counts'] if 'counts' in adata.layers else adata.X

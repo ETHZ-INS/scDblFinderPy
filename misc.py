@@ -7,7 +7,7 @@ import warnings
 import scanpy as sc
 from statsmodels.stats.multitest import fdrcorrection
 
-def cxds2(adata, which_dbls=None, ntop=500, bin_thresh=None, verbose=False, n_top=None):
+def cxds2(adata, which_dbls=None, ntop=500, bin_thresh=None, verbose=False, n_top=None, use_gpu=False):
     """
     Calculates a coexpression-based doublet score (CXDS).
     
@@ -118,12 +118,24 @@ def cxds2(adata, which_dbls=None, ntop=500, bin_thresh=None, verbose=False, n_to
     prb = np.outer(ps, 1 - ps)
     prb = prb + prb.T
 
-    if sp.issparse(Bp):
-        K = (Bp @ Bp.T).toarray()
-        n_counts = np.asarray(Bp.sum(axis=1)).ravel()
-    else:
-        K = Bp @ Bp.T
-        n_counts = np.sum(Bp, axis=1)
+    _gpu_k_done = False
+    if use_gpu:
+        try:
+            import cupy as cp
+            import cupyx.scipy.sparse as cpsp
+            _Bp_gpu = cpsp.csr_matrix(Bp if sp.issparse(Bp) else sp.csr_matrix(Bp))
+            K = cp.asnumpy((_Bp_gpu @ _Bp_gpu.T).toarray())
+            n_counts = cp.asnumpy(_Bp_gpu.sum(axis=1)).ravel()
+            _gpu_k_done = True
+        except Exception:
+            pass
+    if not _gpu_k_done:
+        if sp.issparse(Bp):
+            K = (Bp @ Bp.T).toarray()
+            n_counts = np.asarray(Bp.sum(axis=1)).ravel()
+        else:
+            K = Bp @ Bp.T
+            n_counts = np.sum(Bp, axis=1)
     obs = np.add.outer(n_counts, n_counts) - 2 * K
 
     S = binom.logsf(np.round(obs) - 1, n=Bp.shape[1], p=prb)
@@ -136,11 +148,23 @@ def cxds2(adata, which_dbls=None, ntop=500, bin_thresh=None, verbose=False, n_to
         smin = np.min(S[finite])
         S[S < smin] = smin
 
-    if sp.issparse(x):
-        product = x.multiply(S @ x)
-        scores = np.asarray(product.sum(axis=0)).ravel()
-    else:
-        scores = np.sum(x * (S @ x), axis=0)
+    _gpu_score_done = False
+    if use_gpu:
+        try:
+            import cupy as cp
+            _S_gpu = cp.asarray(S)
+            _x_gpu = cp.asarray(x.toarray() if sp.issparse(x) else x, dtype=cp.float64)
+            _Sx_gpu = _S_gpu @ _x_gpu
+            scores = cp.asnumpy((_x_gpu * _Sx_gpu).sum(axis=0)).ravel()
+            _gpu_score_done = True
+        except Exception:
+            pass
+    if not _gpu_score_done:
+        if sp.issparse(x):
+            product = x.multiply(S @ x)
+            scores = np.asarray(product.sum(axis=0)).ravel()
+        else:
+            scores = np.sum(x * (S @ x), axis=0)
 
     s = -scores
     s = s - np.min(s)
