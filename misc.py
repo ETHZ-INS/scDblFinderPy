@@ -7,6 +7,37 @@ import warnings
 import scanpy as sc
 from statsmodels.stats.multitest import fdrcorrection
 
+
+def get_gpu_backend(use_gpu, rng):
+    """Return (module, seed): rapids-singlecell + seed if GPU is requested and
+    available, otherwise scanpy. Both expose the same pp/tl API used here
+    (normalize_total, log1p, pca, neighbors, leiden), so callers can stay
+    backend-agnostic.
+    """
+    # Keep within signed-int32 range: leidenalg's C extension (used by sc.tl.leiden)
+    # overflows on the full uint32 range integers() can otherwise return.
+    seed = int(rng.integers(0, 2 ** 31 - 1))
+    if use_gpu:
+        try:
+            import rapids_singlecell as rsc
+            return rsc, seed
+        except ImportError:
+            warnings.warn("rapids-singlecell not found. Falling back to CPU (scanpy).")
+    return sc, seed
+
+
+def to_backend_device(adata, backend):
+    """Move `adata` to the GPU in place if `backend` is rapids-singlecell; no-op for scanpy."""
+    if backend is not sc:
+        backend.get.anndata_to_GPU(adata, convert_all=True)
+
+
+def to_cpu(adata, backend):
+    """Move `adata` back to the CPU in place if it was moved to the GPU; no-op for scanpy."""
+    if backend is not sc:
+        backend.get.anndata_to_CPU(adata, convert_all=True)
+
+
 def cxds2(adata, which_dbls=None, ntop=500, bin_thresh=None, verbose=False, n_top=None, use_gpu=False):
     """
     Calculates a coexpression-based doublet score (CXDS).
@@ -76,8 +107,8 @@ def cxds2(adata, which_dbls=None, ntop=500, bin_thresh=None, verbose=False, n_to
             # and only then subsets to the top ntop genes. Keep that exact order.
             p_nonzero_mean = float(np.mean(p_nonzero_vec))
 
-            # Match R's stable `order()` tie-breaking: preserve original gene order on ties.
-            order = np.lexsort((np.arange(p_nonzero_vec.shape[0]), p_nonzero_vec))
+            # Match R's `order()`: a stable ascending sort (ties keep original order).
+            order = np.argsort(p_nonzero_vec, kind='stable')
             keep = order[:ntop]
             x = x[keep, :]
 
@@ -100,11 +131,12 @@ def cxds2(adata, which_dbls=None, ntop=500, bin_thresh=None, verbose=False, n_to
 
     if x.shape[0] > ntop:
         score = ps * (1 - ps)
-        # Match R's order(): sort descending by score, with later indices first on ties.
-        # Due to subtle differences in tie-breaking between numpy and R's order(),
-        # we use the most closely-matching sort: (score, indices) reversed
-        # This gives near-perfect parity with R in most cases
-        sorted_idx = np.lexsort((np.arange(score.shape[0]), score))[::-1]
+        # Match R's order(x, decreasing=TRUE): a stable descending sort (ties keep
+        # original order). Sorting -score ascending with a stable sort is exactly
+        # that; a plain argsort(score)[::-1] would instead reverse tie order and,
+        # with a larger candidate pool (more total features), can silently swap
+        # out genuinely top-ranked genes for their tied neighbours.
+        sorted_idx = np.argsort(-score, kind='stable')
         hvg = sorted_idx[:ntop]
         x = x[hvg, :]
         ps = ps[hvg]
@@ -196,32 +228,33 @@ def select_features(adata, clusters=None, n_features=1000, prop_markers=0.0, fdr
         if clusters is None:
             # global rowMeans (which is column means for Python AnnData)
             means = np.asarray(X.mean(axis=0)).flatten()
-            g_idx = np.argsort(means)[::-1][:ng].tolist()
+            # Stable descending sort, matching R's order(x, decreasing=TRUE).
+            g_idx = np.argsort(-means, kind='stable')[:ng].tolist()
         else:
             try:
                 # Calculate cluster means
                 unique_clusters = np.unique(clusters)
                 n_clusters = len(unique_clusters)
-                
+
                 cl_means = np.zeros((n_vars, n_clusters))
                 for i, cl in enumerate(unique_clusters):
                     mask = (clusters == cl)
                     cl_means[:, i] = np.asarray(X[mask].mean(axis=0)).flatten()
-                
+
                 # Equivalent to R's apply(cl.means, 2, order)[seq_len(n_features)]
                 cl_orders = np.zeros((n_features, n_clusters), dtype=int)
                 for i in range(n_clusters):
-                    cl_orders[:, i] = np.argsort(cl_means[:, i])[::-1][:n_features]
-                
+                    cl_orders[:, i] = np.argsort(-cl_means[:, i], kind='stable')[:n_features]
+
                 # t().as.numeric() flattens row by row (interleaving clusters)
                 cl_orders_flat = cl_orders.flatten()
                 # unique preserving order
                 _, idx = np.unique(cl_orders_flat, return_index=True)
                 g_idx = cl_orders_flat[np.sort(idx)][:ng].tolist()
-                
+
             except Exception as e:
                 means = np.asarray(X.mean(axis=0)).flatten()
-                g_idx = np.argsort(means)[::-1][:ng].tolist()
+                g_idx = np.argsort(-means, kind='stable')[:ng].tolist()
                 
     if ng == n_features:
         return [var_names[i] for i in g_idx]
@@ -300,7 +333,7 @@ def select_features(adata, clusters=None, n_features=1000, prop_markers=0.0, fdr
     except Exception as e:
         print(f"Warning: Marker selection failed, returning fallback top expressed genes. {e}")
         means = np.asarray(X.mean(axis=0)).flatten()
-        g_idx_fallback = np.argsort(means)[::-1][:n_features].tolist()
+        g_idx_fallback = np.argsort(-means, kind='stable')[:n_features].tolist()
         return [var_names[i] for i in g_idx_fallback]
 
     return g_names[:n_features]

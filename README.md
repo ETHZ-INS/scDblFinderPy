@@ -18,26 +18,27 @@ doublet score for each real cell and returns a final class (`doublet` or
 At a high level, the pipeline is:
 1. Optional clustering of real cells (clustered mode).
 2. Feature selection and artificial doublet generation.
-3. Combined real + artificial embedding and KNN feature extraction.
+3. Combined real + artificial embedding (PCA) and KNN feature extraction.
 4. Iterative XGBoost training and score refinement.
 5. Final thresholding to obtain doublet calls.
+
+Clustering, PCA, and nearest-neighbor search are delegated to `scanpy`
+(CPU) / `rapids-singlecell` (GPU, when `use_gpu=True`) rather than
+reimplemented — only the doublet-detection-specific logic (artificial
+doublet generation, CXDS scoring, KNN-derived doublet features, iterative
+XGBoost training, threshold optimization) is custom to this package.
 
 ## Repository layout
 
 ```
 scDblFinderPy/              ← repo root (this directory is the Python package)
+├── pyproject.toml          package metadata + pinned dependency versions
 ├── scDblFinder.py          main pipeline — contains compute_doublet_score()
-├── clustering.py
+├── clustering.py           fast_cluster(): scanpy/rapids-singlecell clustering
 ├── doublet_generation.py
-├── misc.py
+├── misc.py                 cxds2, select_features, GPU-backend helpers
 ├── thresholding.py
-├── rng.py
-├── graph.py
-├── biocneighbors_kmknn.py
-├── louvain_controlled.py
-├── hw_kmeans.py
-├── r_mt19937.py
-├── r_sample_emulation.py
+├── rng.py                  coerce_rng(): numpy Generator seeding helper
 ```
 
 ## Setup
@@ -57,23 +58,47 @@ source .venv/bin/activate
 pip install --upgrade pip
 ```
 
-### 3. Install dependencies
+### 3. Install the package
 
 ```bash
-pip install numpy pandas scipy anndata scanpy scikit-learn xgboost
+pip install .
+# or, for local development (edits take effect without reinstalling):
+pip install -e .
 ```
 
-Optional — GPU acceleration (requires a CUDA-capable machine):
+This installs the exact dependency versions pinned in `pyproject.toml`
+(`numpy`, `pandas`, `scipy`, `anndata`, `scanpy`, `scikit-learn`, `xgboost`,
+`statsmodels`, `leidenalg`, `igraph`) and registers `scDblFinderPy` as a
+normal importable package — no `sys.path` hacks needed. See
+[Reproducibility](#reproducibility) below for why the pins matter.
+
+Optional — GPU acceleration (requires a CUDA-capable machine). When
+`use_gpu=True`, clustering/PCA/neighbor search run via `rapids-singlecell`
+and XGBoost trains on the GPU (`device='cuda'`):
 
 ```bash
-pip install rapids-singlecell cuml
+pip install .[gpu]
 ```
+
+`rapids-singlecell` and `cuml` are not reliably pip-installable in general
+(the available wheels depend on your exact CUDA toolkit version) — NVIDIA's
+recommended path is conda/mamba via the
+[RAPIDS release selector](https://docs.rapids.ai/install/). This package was
+developed and tested against `rapids-singlecell==0.15.0`, `cuml==26.4.0`,
+`cupy==14.0.1` installed that way.
 
 ## Using the package in your own scripts
 
-Because the repo root itself is the Python package, you need to add its
-**parent directory** to `sys.path` before importing. Assuming you cloned into
-`/path/to/scDblFinderPy`:
+Once installed (see Setup), import it directly:
+
+```python
+from scDblFinderPy.scDblFinder import compute_doublet_score
+```
+
+If you'd rather not install it — e.g. quick experimentation without
+`pip install` — you can still fall back to adding the repo's **parent**
+directory to `sys.path` (this skips the pinned-version guarantee below,
+since it relies on whatever is already on `sys.path`):
 
 ```python
 import sys
@@ -143,10 +168,10 @@ If `return_type='full'`, the returned object also includes artificial doublets.
 | Parameter | Default | Description |
 |---|---|---|
 | `clusters_col` | `None` | `None` for random mode; column name for clustered mode |
-| `n_features` | `1352` | number of genes used for feature selection |
+| `n_features` | `1352` | number of genes used for feature selection (matches R's `nfeatures`) |
 | `n_components` | `20` | number of PCA components |
 | `n_artificial` | `None` | override number of artificial doublets (auto if `None`) |
-| `prop_random` | `0.1` | fraction of artificial doublets generated randomly |
+| `prop_random` | `0` | fraction of artificial doublets generated randomly (matches R's `propRandom`) |
 | `n_iters` | `3` | iterative classifier refinement rounds |
 | `dbr_per1k` | `0.008` | expected doublet rate per 1k cells |
 | `stringency` | `0.5` | threshold optimisation aggressiveness |
@@ -181,15 +206,38 @@ Results are saved to `benchmarking/python_benchmark_hm-6k.csv`.
 Datasets must be present as `benchmarking/datasets/<name>.h5ad` and must
 contain a `truth` column in `adata.obs` with values `doublet` / `singlet`.
 
-## Reproducibility tips
+## Reproducibility
 
-- Fix `random_state` when comparing runs.
-- Keep package versions stable (especially `scanpy`, `scikit-learn`, `xgboost`).
-- Use the same preprocessing assumptions (counts in `adata.X` or `adata.layers['counts']`).
+Given the same input data, `random_state`, and library versions, two runs on
+the same machine produce bit-identical `scDblFinder_score` output (verified
+for both `use_gpu=False` and `use_gpu=True`, in random and clustered mode).
+That guarantee has some real limits worth knowing before you rely on it:
+
+- **Pin your dependency versions.** `scanpy`, `leidenalg`, `xgboost`, and
+  `numpy` all change numerical internals (PCA solver defaults, clustering
+  backend, histogram construction) across releases, independent of RNG
+  seeding. Installing via `pip install .` (see Setup) pins the exact
+  versions this package was developed against — an unpinned
+  `pip install scanpy ...` will drift over time.
+- **Different machines are not guaranteed to match**, even with identical
+  package versions. numpy/scipy delegate to BLAS (OpenBLAS/MKL), which picks
+  different code paths per CPU (AVX2/AVX512/thread count), producing
+  ULP-level floating-point differences that can cascade through PCA into
+  clustering and scores. This is a general property of the numpy/scipy/scanpy
+  stack, not specific to this package.
+- **GPU mode (`use_gpu=True`) is best-effort, not guaranteed**, across
+  different GPU models, driver versions, or CUDA toolkit versions — RAPIDS/
+  cuML has known non-deterministic reduction operations in places. Treat
+  GPU reproducibility as "consistent within one fixed environment," not
+  "identical everywhere."
+- Use the same preprocessing assumptions (counts in `adata.X` or
+  `adata.layers['counts']`) when comparing runs.
 
 ## Notes and current limitations
 
-- `samples_col` is accepted but currently ignored in the Python pipeline.
+- Multi-sample mode (R's `samples`/`multiSampleMode` arguments) is not
+  implemented; there is no `samples_col`-equivalent parameter. All cells are
+  processed together regardless of sample of origin.
 - Some low-level numerical differences from the R package are expected due to
   library backend differences.
 

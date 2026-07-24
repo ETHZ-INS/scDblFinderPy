@@ -1,48 +1,20 @@
 import numpy as np
 import scipy.sparse as sp
-import warnings
 import pandas as pd
 from anndata import AnnData
-import scanpy as sc
 import itertools
-import random
-from .r_sample_emulation import sample_int_r
-from .rng import coerce_rng, CentralRNG
+from .rng import coerce_rng
 
 
-def _coerce_rng(random_state=None, rng=None):
-    # Return a CentralRNG instance coerced from inputs.
-    return coerce_rng(random_state=random_state, rng=rng)
-
-
-def _python_random_from_rng(rng):
-    # Accept CentralRNG, numpy Generator, or RandomState
-    if hasattr(rng, "integers"):
-        seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
-    elif hasattr(rng, 'randint32'):
-        seed = int(rng.randint32())
-    else:
-        seed = int(getattr(rng, 'randint', lambda a, b: 0)(0, 2**32 - 1))
-    return random.Random(seed)
-
-
-def _sample_python(values, size, rng, replace=False):
-    values = np.asarray(values)
-    if size <= 0 or values.size == 0:
-        return np.array([], dtype=values.dtype)
-    # Use CentralRNG or derive a RandomState for Python's sampling if needed
-    if isinstance(rng, CentralRNG) or hasattr(rng, 'randint32'):
-        sample_rng = rng
-    elif hasattr(rng, 'integers'):
-        # derive deterministic RandomState from provided Generator
-        sample_rng = np.random.RandomState(int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32)))
-    else:
-        sample_rng = np.random.RandomState(int(rng))
-
-    idx = sample_int_r(len(values), size, replace=replace, rng=sample_rng) - 1
+def _sample_indices(rng, n, size, replace=False):
+    """Sample `size` indices from range(n) using a numpy Generator."""
+    if size <= 0:
+        return np.array([], dtype=np.int64)
     if replace:
-        return values[idx]
-    return values[idx]
+        return rng.integers(0, n, size=size).astype(np.int64)
+    if size > n:
+        raise ValueError("cannot take a larger sample than population when 'replace=False'")
+    return rng.permutation(n)[:size].astype(np.int64)
 
 def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust_size=False, random_state=0, rng=None, debug_outdir=None):
     """
@@ -73,8 +45,7 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
         Matrix of artificial doublets (N_doublets x N_genes).
     """
 
-    rng = _coerce_rng(random_state=random_state, rng=rng)
-    sample_rng = rng
+    rng = coerce_rng(random_state=random_state, rng=rng)
     
     def check_prop_arg(arg):
         if isinstance(arg, bool):
@@ -100,7 +71,7 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
     n_adjust = int(round(adjust_size_val * n_doublets))
     
     if n_adjust > 0:
-        w_ad = sample_int_r(n_doublets, n_adjust, replace=False, rng=sample_rng) - 1
+        w_ad = _sample_indices(rng, n_doublets, n_adjust, replace=False)
     else:
         w_ad = np.array([], dtype=int)
          
@@ -200,7 +171,7 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
     if half_size_val > 0:
         n_half = int(np.ceil(half_size_val * n_doublets))
         if n_half > 0:
-            w_half = sample_int_r(n_doublets, n_half, replace=False, rng=sample_rng) - 1
+            w_half = _sample_indices(rng, n_doublets, n_half, replace=False)
             coeffs = np.ones(n_doublets)
             coeffs[w_half] = 0.5
             scaler = sp.diags(coeffs)
@@ -216,7 +187,7 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
         else:
              n_resamp = int(np.ceil(resamp_val * n_doublets))
              if n_resamp > 0:
-                 w_resamp = sample_int_r(n_doublets, n_resamp, replace=False, rng=sample_rng) - 1
+                 w_resamp = _sample_indices(rng, n_doublets, n_resamp, replace=False)
              else:
                  w_resamp = np.array([], dtype=int)
         
@@ -299,12 +270,11 @@ def get_expected_doublets(clusters, dbr=None, only_heterotypic=True, dbr_per_1k=
                
     return res
 
-def get_cell_pairs(clusters, n=1000, ls=None, q=(0.1, 0.9), sel_mode="proportional", soft_min=5, random_state=0, rng=None, debug_outdir=None, use_sample_int=True):
+def get_cell_pairs(clusters, n=1000, ls=None, q=(0.1, 0.9), sel_mode="proportional", soft_min=5, random_state=0, rng=None, debug_outdir=None):
     """
     Given a vector of cluster labels, returns pairs of cross-cluster cell indices.
     """
-    rng = _coerce_rng(random_state=random_state, rng=rng)
-    sample_rng = rng
+    rng = coerce_rng(random_state=random_state, rng=rng)
     clusters = np.asarray(clusters)
     n_cells = len(clusters)
     indices = np.arange(n_cells)
@@ -387,14 +357,10 @@ def get_cell_pairs(clusters, n=1000, ls=None, q=(0.1, 0.9), sel_mode="proportion
             continue
             
         # Sample with replacement if needed
-        if use_sample_int:
-            pos1 = sample_int_r(len(cells1), count, replace=(count > len(cells1)), rng=sample_rng) - 1
-            pos2 = sample_int_r(len(cells2), count, replace=(count > len(cells2)), rng=sample_rng) - 1
-            idx1 = cells1[pos1]
-            idx2 = cells2[pos2]
-        else:
-            idx1 = _sample_python(cells1, size=count, rng=rng, replace=(count > len(cells1)))
-            idx2 = _sample_python(cells2, size=count, rng=rng, replace=(count > len(cells2)))
+        pos1 = _sample_indices(rng, len(cells1), count, replace=(count > len(cells1)))
+        pos2 = _sample_indices(rng, len(cells2), count, replace=(count > len(cells2)))
+        idx1 = cells1[pos1]
+        idx2 = cells2[pos2]
         
         pairs = np.column_stack((idx1, idx2))
         all_pairs.append(pairs)
@@ -443,8 +409,7 @@ def _get_meta_cells(X, clusters, n_meta_cells=20, meta_cell_size=20, rng=None):
     Creates within-cluster meta-cells from a count matrix.
     Returns (meta_X, meta_clusters)
     """
-    rng = _coerce_rng(rng=rng)
-    sample_rng = rng
+    rng = coerce_rng(rng=rng)
     clusters = np.asarray(clusters)
     unique_clusters = np.unique(clusters)
     
@@ -464,7 +429,7 @@ def _get_meta_cells(X, clusters, n_meta_cells=20, meta_cell_size=20, rng=None):
         
         # R logic: sample(...) replace=FALSE
         for _ in range(n_meta_cells):
-            sample_idx = sample_int_r(len(c_indices), size_to_sample, replace=False, rng=sample_rng) - 1
+            sample_idx = _sample_indices(rng, len(c_indices), size_to_sample, replace=False)
             sample_idx = c_indices[sample_idx]
             
             # Use X[sample_idx] and Compute Mean
@@ -495,8 +460,7 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
     if not sp.issparse(X):
         X = sp.csr_matrix(X)
 
-    rng = _coerce_rng(random_state=random_state, rng=rng)
-    sample_rng = rng
+    rng = coerce_rng(random_state=random_state, rng=rng)
         
     n_cells = X.shape[0]
     ls = np.array(X.sum(axis=1)).flatten()
@@ -544,7 +508,7 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
         # Generate random pairs.
         # Match R: sample 2*n indices, without replacement when possible, then reshape.
         replace = (2 * n_random >= n_curr)
-        sampled = sample_int_r(n_curr, size=2 * n_random, replace=replace, rng=sample_rng) - 1
+        sampled = _sample_indices(rng, n_curr, 2 * n_random, replace=replace)
         # R fills sampled values column-major when reshaping into pairs
         pairs_r = sampled.reshape(-1, 2, order='F')
         # Remove self-pairs
@@ -573,7 +537,7 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
     n_cluster_dbl = int(np.ceil(n_main * (0.9 if (clusters is not None and n_meta_cells > 0) else 1.0)))
     if n_cluster_dbl > 0 and clusters is not None:
 
-        ca_pairs, ca_origins = get_cell_pairs(clusters_curr, n=n_cluster_dbl, sel_mode=sel_mode, rng=rng, debug_outdir=debug_outdir, use_sample_int=True)
+        ca_pairs, ca_origins = get_cell_pairs(clusters_curr, n=n_cluster_dbl, sel_mode=sel_mode, rng=rng, debug_outdir=debug_outdir)
 
         if len(ca_pairs) > 0:
             X_cluster = create_doublets(X_curr, ca_pairs, clusters=clusters_curr,
@@ -594,7 +558,7 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
         if meta_X is not None:
             n_meta_dbl = int(np.ceil(n_main * 0.1)) # 10% of the reduced main count
 
-            ca_meta_pairs, ca_meta_origins = get_cell_pairs(meta_cl, n=n_meta_dbl, rng=rng, debug_outdir=debug_outdir, use_sample_int=True)
+            ca_meta_pairs, ca_meta_origins = get_cell_pairs(meta_cl, n=n_meta_dbl, rng=rng, debug_outdir=debug_outdir)
 
             if len(ca_meta_pairs) > 0:
                 # R: createDoublets(..., resamp=TRUE) -> resamp=1.0
@@ -627,7 +591,7 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
              # Create meta cells for triplets
              # R: n.meta.cells=1, meta.cell.size=100
              meta_tri_X, meta_tri_cl = _get_meta_cells(X_curr[w_triplet], clusters_curr[w_triplet],
-                                                        n_meta_cells=1, meta_cell_size=100)
+                                                        n_meta_cells=1, meta_cell_size=100, rng=rng)
 
              if meta_tri_X is not None and meta_tri_X.shape[0] >= 3:
                  # Generate all combinations of length 3

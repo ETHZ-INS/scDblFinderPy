@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scDblFinderPy"
+version = "0.1.0"
+description = "Python implementation of the scDblFinder doublet-detection workflow for AnnData/Scanpy."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy==2.4.3",
+    "pandas==2.3.3",
+    "scipy==1.16.3",
+    "anndata==0.12.13",
+    "scanpy==1.12.1",
+    "scikit-learn==1.8.0",
+    "xgboost==3.2.0",
+    "statsmodels==0.14.6",
+    "leidenalg==0.11.0",
+    "igraph==1.0.0",
+]
+
+# GPU acceleration (use_gpu=True) additionally requires rapids-singlecell and
+# cuml, which NVIDIA distributes primarily through conda/mamba rather than
+# PyPI (exact wheel availability depends on your CUDA toolkit version) — see
+# the README's GPU setup section instead of relying on this extra alone.
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda12x",
+]
+
+[tool.setuptools]
+packages = ["scDblFinderPy"]
+package-dir = { "scDblFinderPy" = "." }

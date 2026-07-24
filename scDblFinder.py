@@ -1,20 +1,22 @@
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import random
 import os
 import json
 import time
 from anndata import AnnData
 import scipy.sparse as sp
-from sklearn.neighbors import NearestNeighbors
 import xgboost as xgb
 import warnings
-import glob
 
 from .clustering import fast_cluster
 from .doublet_generation import get_artificial_doublets
-from .misc import cxds2, select_features
+from .misc import (
+    cxds2, select_features,
+    get_gpu_backend as _get_backend,
+    to_backend_device as _to_gpu,
+    to_cpu as _to_cpu,
+)
 from .thresholding import _gdbr, doublet_thresholding_optim
 from .rng import coerce_rng
 
@@ -59,24 +61,20 @@ def _filter_unrecognizable_doublets(d, minSize=5, minMedDiff=0.1):
     return drop_origins
 
 def compute_doublet_score(
-    adata, 
+    adata,
     n_neighbors=None,
-    n_features=1000, 
+    n_features=1352,
     n_components=20,
-    artificial_doublets_ratio=1.0, # Approx ratio to n_cells or fixed number? R uses fixed formula.
     n_artificial=None,
     clusters_col=None,
-    samples_col=None, # R: samples=NULL
     use_gpu=False,
     random_state=42,
     n_iters=3,
-    # R parameter equivalents
     clust_cor=None, # clustCor
-    prop_random=0.1, # propRandom (R default)
+    prop_random=0, # propRandom (R default, from scDblFinder()'s own signature)
     adjust_size=0.25,
     meta_triplets=True,
     prop_markers=0.0, # propMarkers
-    aggregate_features=False, # aggregateFeatures
     score_metric='logloss', # metric
     nrounds=0.25,
     max_depth=4,
@@ -88,17 +86,29 @@ def compute_doublet_score(
     dbr_sd=None,
     dbr_per1k=0.008,
     stringency=0.5,
-    return_type='adata', 
+    return_type='adata',
     verbose=True,
     debug=False
 ):
     """
     Main function to compute doublet scores using the scDblFinder method.
-    
+
     Parameters
     ----------
     adata : AnnData
-        Input data.
+        Annotated data matrix with cells as rows (`.obs`) and genes as columns
+        (`.var`), matching the standard AnnData/Scanpy convention. Required:
+        - Raw (unnormalized) integer counts in either `adata.X` or
+          `adata.layers['counts']`. If both are absent/non-integer, a warning
+          is raised and `adata.X` is used as-is (results may be suboptimal).
+        - `adata.var_names` should be gene identifiers (used to align real and
+          artificial-doublet feature spaces).
+        - `adata.obs_names` should be unique cell barcodes/IDs (used to map
+          scores back onto the input after internal processing).
+        - If `clusters_col` names an existing `adata.obs` column, it is used
+          directly as the cluster labels for artificial doublet generation; if
+          it names a column that doesn't yet exist, `fast_cluster` computes
+          and writes cluster labels there (in place, on this same `adata`).
     n_neighbors : int, optional
         Number of neighbors for KNN. If None, uses heuristic.
     n_features : int
@@ -109,42 +119,41 @@ def compute_doublet_score(
         Number of artificial doublets to generate. If None, derived from dataset size/clusters.
     clusters_col : str
         Column in adata.obs storing cluster labels. If not present, fast_cluster is run.
-    samples_col : str, optional
-        Column in adata.obs storing sample information. 
-        If provided and multi_sample_mode is 'split', processing is done per sample.
     use_gpu : bool
         Whether to use GPU acceleration where possible.
     random_state : int
         Random seed.
     n_iters : int
-        Number of iterations for the classifier training. 
+        Number of iterations for the classifier training.
     clust_cor : int or matrix, optional
-        Include correlations to cell type averages. Not yet implemented.
+        Include Spearman correlations to cluster/cell-type marker signatures
+        as additional predictors. If an integer, that many top per-cluster
+        markers are selected and correlated; if a 2D array/DataFrame (genes x
+        cell types), its columns are used directly as marker signatures. Off
+        (`None`) by default, matching R's `clustCor=NULL`.
     prop_random : float
-        Proportion of artificial doublets to be made of random cells.
-    aggregate_features : bool
-        Whether to perform feature aggregation (for ATAC). Not yet implemented.
+        Proportion of artificial doublets to be made of random cells (as
+        opposed to inter-cluster combinations). Ignored (treated as 1) when
+        `clusters_col` is None.
+    prop_markers : float
+        Proportion of features to select based on marker identification
+        (the remainder are selected by overall/per-cluster expression).
     score_metric : str
         Error metric for XGBoost (e.g. 'logloss').
     training_features : list or str
         Features to use for training. 'default' uses standard set.
-    multi_sample_mode : str
-        'split', 'singleModel', 'asOne'. Currently only 'asOne' (global) logic is detailed below.
     return_type : str
         'adata': matches input, adds scores.
         'full': returns the extended AnnData with artificial doublets.
     verbose : bool
         Print progress.
-        
+
     Returns
     -------
     AnnData
         The input AnnData with 'scDblFinder_score' and 'scDblFinder_class' in `.obs`.
         If return_type='full', returns combined object.
     """
-    
-    if samples_col is not None:
-        warnings.warn("multi_sample_mode has been removed; samples_col is ignored.")
 
     # Central RNG: drives all randomness in the pipeline
     central_rng = coerce_rng(random_state=random_state)
@@ -309,56 +318,19 @@ def compute_doublet_score(
     # 4. Dimension Reduction (PCA)
     # ----------------------------
     if verbose: print("Processing and running PCA...")
-    
-    # Normalize & PCA - align with R's .defaultProcessing: normalizeCounts then PCA via Irlba
-    # Use the raw counts backup for R-like normalization
+
     adata_combined.layers['counts'] = adata_combined.X.copy()
-    counts_mat = adata_combined.layers['counts']
-    # ensure dense numeric array for SVD
-    if sp.issparse(counts_mat):
-        counts_arr = counts_mat.toarray().astype(float)
-    else:
-        counts_arr = np.asarray(counts_mat, dtype=float)
 
-    # R normalizeCounts: library-size normalize, then transform before PCA.
-    lib_sizes = counts_arr.sum(axis=1)
-    mean_lib = lib_sizes.mean() if lib_sizes.size>0 else 1.0
-    size_factors = lib_sizes / mean_lib
-    # avoid division by zero
-    size_factors[size_factors == 0] = 1.0
-    norm_counts = counts_arr / size_factors[:, None]
-    # scuttle::normalizeCounts stores log-normalized values; use log2(1+x) to
-    # match the Bioconductor convention more closely than scanpy's default log1p.
-    norm_counts = np.log2(norm_counts + 1.0)
+    backend, seed = _get_backend(use_gpu, central_rng)
+    _to_gpu(adata_combined, backend)
+    backend.pp.normalize_total(adata_combined)
+    backend.pp.log1p(adata_combined)
+    n_comp_eff = min(n_components, min(adata_combined.shape) - 1)
+    backend.pp.pca(adata_combined, n_comps=n_comp_eff, random_state=seed)
+    _to_cpu(adata_combined, backend)
 
-    # center genes (columns) as scater::calculatePCA does centering before SVD
-    gene_means = np.mean(norm_counts, axis=0)
-    norm_centered = norm_counts - gene_means
-
-    # Compute PCA in pure Python using randomized SVD to mimic R's irlba
-    try:
-        from sklearn.utils.extmath import randomized_svd
-        n_comp_eff = min(n_components, min(norm_centered.shape))
-        # randomized_svd expects (n_samples, n_features) array
-        # use a deterministic seed derived from random_state for reproducibility
-        rand_state = random_state if isinstance(random_state, (int, float)) else 42
-        U, S, VT = randomized_svd(norm_centered, n_components=n_comp_eff, random_state=int(rand_state))
-        pcs = U[:, :n_comp_eff] * S[:n_comp_eff]
-    except Exception:
-        try:
-            # fallback to full SVD
-            U, S, VT = np.linalg.svd(norm_centered, full_matrices=False)
-            k = min(n_components, U.shape[1])
-            pcs = U[:, :k] * S[:k]
-        except Exception:
-            # final fallback: use sklearn PCA on the log-normalized counts
-            from sklearn.decomposition import PCA
-            n_comp_eff = min(n_components, min(norm_centered.shape))
-            pca = PCA(n_components=n_comp_eff, svd_solver='auto', random_state=int(random_state if isinstance(random_state, (int, float)) else 42))
-            pcs = pca.fit_transform(norm_centered)
-
-    # store PCA coordinates in obsm as cells x components
-    adata_combined.obsm['X_pca'] = pcs
+    # Restore raw counts on .X (normalize/log1p above ran in place).
+    adata_combined.X = adata_combined.layers['counts']
 
     # Compute cluster-correlations predictors if requested (clustCor in R)
     # R computes these on the counts matrix before PCA and adds them to the
@@ -442,7 +414,7 @@ def compute_doublet_score(
         except Exception as e:
             if verbose:
                 print('Failed to compute clustCor predictors:', e)
-    
+
     # 5. KNN & Doublet Features
     # -------------------------
     if verbose: print("Evaluating KNN features...")
@@ -452,8 +424,7 @@ def compute_doublet_score(
         n_neighbors = max(int(np.ceil(np.sqrt(n_cells / 2.0))), 25)
         
     knn_features = _evaluate_knn(adata_combined, n_neighbors=n_neighbors,
-                                 use_gpu=use_gpu, random_state=random_state,
-                                 random_mode=(clusters is None))
+                                 use_gpu=use_gpu, random_state=random_state)
     
     # Add features to obs
     for col, values in knn_features.items():
@@ -632,10 +603,14 @@ def compute_doublet_score(
                 'max_depth': max_depth,
                 'learning_rate': eta,
                 'subsample': 0.75,
-                'tree_method': 'exact',
+                # 'exact' has no GPU implementation; 'hist' runs on both CPU and GPU,
+                # with the actual device selected via the 'device' param below.
+                'tree_method': 'hist' if use_gpu else 'exact',
                 'nthread': 1,
                 'seed': random_state,
             }
+            if use_gpu:
+                params['device'] = 'cuda'
 
             if nrounds is None or nrounds < 1:
                 cv_results = xgb.cv(
@@ -892,7 +867,7 @@ def compute_doublet_score(
     return adata_orig
 
 
-def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42, random_mode=False):
+def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
     """
     Calculates KNN-based features for doublet detection.
 
@@ -905,104 +880,44 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42, random_
 
     n_obs = X_pca.shape[0]
 
-    # Request n_neighbors + 1 so that after stripping the query point (which both
-    # sklearn and pynndescent include at distance 0) we are left with exactly
-    # n_neighbors true non-self neighbors — matching R's findKNN behaviour.
-    _n_query = n_neighbors + 1
+    # Find neighbors via scanpy (CPU) / rapids-singlecell (GPU) instead of hand-rolled
+    # sklearn/pynndescent/cuml variants. Request a small buffer beyond n_neighbors: scanpy
+    # already excludes the query point itself, while rapids-singlecell's neighbor search
+    # does not reliably do so, so we mask out any self-matches below rather than assume
+    # a fixed column holds them.
+    central_rng = coerce_rng(random_state=random_state)
+    backend, seed = _get_backend(use_gpu, central_rng)
+    _n_query = min(n_neighbors + 2, n_obs - 1)
 
-    # In random mode, use exact KNN for datasets up to 50k combined cells.
-    # pynndescent's approximation degrades on larger datasets (e.g. hm-12k at 21k cells),
-    # causing a growing AUPRC gap vs R. Exact KNN eliminates that error.
-    # In cluster mode keep pynndescent: exact KNN changes cluster-doublet feature values
-    # in ways that hurt AUPRC on within-tissue datasets (e.g. pbmc).
-    _EXACT_KNN_THRESHOLD = 50000
+    tmp = AnnData(np.zeros((n_obs, 1), dtype=np.float32))
+    tmp.obsm['X_pca'] = X_pca
+    _to_gpu(tmp, backend)
+    backend.pp.neighbors(tmp, n_neighbors=_n_query, use_rep='X_pca', metric='euclidean', random_state=seed)
+    _to_cpu(tmp, backend)
+    D = tmp.obsp['distances']
+    if not sp.issparse(D):
+        D = D.get()
+    D = sp.csr_matrix(D)
+    row_nnz = np.diff(D.indptr)
+    k_stored = int(row_nnz[0])
+    if not np.all(row_nnz == k_stored):
+        raise RuntimeError(
+            "Neighbor graph has a non-uniform number of neighbors per cell "
+            f"(expected {k_stored} for all {n_obs} cells); cannot reshape into a "
+            "dense (n_obs, k) array. This would silently misalign neighbor data "
+            "if not caught here."
+        )
+    indices = D.indices.reshape(n_obs, k_stored)
+    distances = D.data.reshape(n_obs, k_stored)
 
-    _knn_done = False
-    if use_gpu and random_mode and n_obs <= _EXACT_KNN_THRESHOLD:
-        try:
-            from cuml.neighbors import NearestNeighbors as _CuNNbrs
-            _nbrs_gpu = _CuNNbrs(n_neighbors=_n_query, metric='euclidean')
-            _nbrs_gpu.fit(X_pca)
-            distances, indices = _nbrs_gpu.kneighbors(X_pca)
-            if hasattr(distances, 'to_numpy'):
-                distances = distances.to_numpy()
-            elif hasattr(distances, 'get'):
-                distances = distances.get()
-            if hasattr(indices, 'to_numpy'):
-                indices = indices.to_numpy()
-            elif hasattr(indices, 'get'):
-                indices = indices.get()
-            distances = np.asarray(distances, dtype=float)
-            indices = np.asarray(indices, dtype=int)
-            _knn_done = True
-        except Exception:
-            pass
-
-    if not _knn_done and random_mode and n_obs <= _EXACT_KNN_THRESHOLD:
-        nbrs = NearestNeighbors(n_neighbors=_n_query, algorithm='ball_tree',
-                                metric='euclidean', n_jobs=-1)
-        nbrs.fit(X_pca)
-        distances, indices = nbrs.kneighbors(X_pca)
-        _knn_done = True
-
-    if not _knn_done:
-        try:
-            import warnings as _warnings
-            from pynndescent import NNDescent
-            with _warnings.catch_warnings():
-                _warnings.simplefilter("ignore")
-                _nn_index = NNDescent(X_pca, n_neighbors=_n_query,
-                                      metric='euclidean', random_state=random_state)
-            indices, distances = _nn_index.neighbor_graph
-            indices   = np.asarray(indices,   dtype=int).copy()
-            distances = np.asarray(distances, dtype=float).copy()
-            _knn_done = True
-        except ImportError:
-            pass
-
-        if not _knn_done:
-            nbrs = NearestNeighbors(n_neighbors=_n_query, algorithm='auto', n_jobs=-1).fit(X_pca)
-            distances, indices = nbrs.kneighbors(X_pca)
-
-    # Sort each row by (distance, index) for deterministic tie-breaking.
-    _o1       = np.argsort(indices,   axis=1, kind='stable')
-    distances = np.take_along_axis(distances, _o1, axis=1)
-    indices   = np.take_along_axis(indices,   _o1, axis=1)
-    _o2       = np.argsort(distances, axis=1, kind='stable')
-    distances = np.take_along_axis(distances, _o2, axis=1)
-    indices   = np.take_along_axis(indices,   _o2, axis=1)
-
-    # Strip the query point (self) from every row, then keep n_neighbors entries.
-    # Self appears at distance 0; after distance-sorting it is at column 0.
-    # We check explicitly to handle any edge case where self might not be present.
-    _rows      = np.arange(n_obs)
-    _self_mask = (indices == _rows[:, None])   # (n_obs, n_query)
-
-    clean_idx  = np.empty((n_obs, n_neighbors), dtype=int)
-    clean_dist = np.empty((n_obs, n_neighbors), dtype=float)
-
-    # Vectorised path: if self is always at column 0 (the common case), slice columns 1:
-    if _self_mask[:, 0].all():
-        clean_idx  = indices[:, 1:n_neighbors + 1]
-        clean_dist = distances[:, 1:n_neighbors + 1]
-    else:
-        # Fallback: per-row removal for rows where self is not at column 0.
-        clean_idx  = indices[:, 1:n_neighbors + 1].copy()
-        clean_dist = distances[:, 1:n_neighbors + 1].copy()
-        for i in np.where(~_self_mask[:, 0])[0]:
-            sp_arr = np.where(_self_mask[i])[0]
-            if sp_arr.size > 0:
-                sp_pos = sp_arr[0]
-                row_i  = np.delete(indices[i],   sp_pos)[:n_neighbors]
-                row_d  = np.delete(distances[i], sp_pos)[:n_neighbors]
-            else:
-                row_i  = indices[i, :n_neighbors]
-                row_d  = distances[i, :n_neighbors]
-            clean_idx[i]  = row_i
-            clean_dist[i] = row_d
-
-    indices   = clean_idx
-    distances = clean_dist
+    # Mask every self-match to +inf so it naturally sorts to the end, then take the
+    # n_neighbors closest true neighbors. Handles 0, 1, or (rarely) multiple self
+    # entries uniformly, regardless of which backend produced the raw neighbor lists.
+    self_mask = (indices == np.arange(n_obs)[:, None])
+    distances = np.where(self_mask, np.inf, distances)
+    order = np.argsort(distances, axis=1, kind='stable')
+    indices = np.take_along_axis(indices, order, axis=1)[:, :n_neighbors]
+    distances = np.take_along_axis(distances, order, axis=1)[:, :n_neighbors]
     # distances[:, 0] is now the distance to the true nearest non-self neighbor.
 
     # Sections 1-3 and 5 are pure array ops on (n_obs, n_neighbors) matrices.
