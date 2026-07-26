@@ -1,7 +1,6 @@
 import numpy as np
 import scipy.sparse as sp
 import pandas as pd
-from anndata import AnnData
 import itertools
 from .rng import coerce_rng
 
@@ -15,6 +14,31 @@ def _sample_indices(rng, n, size, replace=False):
     if size > n:
         raise ValueError("cannot take a larger sample than population when 'replace=False'")
     return rng.permutation(n)[:size].astype(np.int64)
+
+
+def _replace_rows(X_csr, row_idx, new_rows):
+    """Return a copy of `X_csr` with the rows at `row_idx` (in that order) replaced by
+    `new_rows`, all other rows unchanged. Avoids `.tolil()`, which converts the whole
+    matrix via a Python-level loop over rows and is expensive for large matrices when
+    only a small subset of rows actually needs updating.
+    """
+    n = X_csr.shape[0]
+    row_idx = np.asarray(row_idx)
+
+    if not sp.issparse(new_rows):
+        new_rows = sp.csr_matrix(new_rows)
+
+    mask = np.zeros(n, dtype=bool)
+    mask[row_idx] = True
+    keep_idx = np.where(~mask)[0]
+
+    order = np.concatenate([keep_idx, row_idx])
+    stacked = sp.vstack([X_csr[keep_idx], new_rows], format='csr')
+
+    inverse = np.empty(n, dtype=np.int64)
+    inverse[order] = np.arange(n)
+    return stacked[inverse]
+
 
 def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust_size=False, random_state=0, rng=None, debug_outdir=None):
     """
@@ -160,11 +184,9 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
             scale_factors[current_sums == 0] = 1.0 
         
         X2_final = X2_combined.multiply(scale_factors[:, None])
-        
+
         # Place back into the main doublet matrix
-        X_dbl = X_dbl.tolil()
-        X_dbl[idx_to_adj_in_dbl, :] = X2_final
-        X_dbl = X_dbl.tocsr()
+        X_dbl = _replace_rows(X_dbl, idx_to_adj_in_dbl, X2_final)
 
     # 3. Handle Half Size (halfSize)
     w_half = np.array([], dtype=int)
@@ -194,10 +216,8 @@ def create_doublets(X, dbl_idx, clusters=None, resamp=0.5, half_size=0.5, adjust
         if len(w_resamp) > 0:
             sub_X = X_dbl[w_resamp].toarray()
             sub_X = rng.poisson(sub_X)
-            
-            X_dbl = X_dbl.tolil()
-            X_dbl[w_resamp, :] = sp.csr_matrix(sub_X)
-            X_dbl = X_dbl.tocsr()
+
+            X_dbl = _replace_rows(X_dbl, w_resamp, sp.csr_matrix(sub_X))
     else:
         # If no resampling, round to nearest integer
         if sp.issparse(X_dbl):
@@ -613,9 +633,10 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
 
                      X_triplets = (X_A + X_B + X_C) / 2.0
                      if sp.issparse(X_triplets):
-                         X_triplets.data = np.round(X_triplets.data)
+                         X_triplets.data = np.rint(X_triplets.data).astype(np.int64)
+                         X_triplets = X_triplets.tocsr()
                      else:
-                         X_triplets = np.round(X_triplets)
+                         X_triplets = np.rint(X_triplets).astype(np.int64)
 
                      results_X.append(X_triplets)
                      results_origins.extend([f"artTriplet" for _ in range(X_triplets.shape[0])])
@@ -625,73 +646,9 @@ def get_artificial_doublets(X, n=3000, clusters=None, resamp=0.25,
     if not results_X:
         return {"counts": sp.csr_matrix((0, X.shape[1])), "origins": [], "types": []}
 
-    final_X = sp.vstack(results_X)
+    final_X = sp.vstack(results_X, format='csr')
+    # Defensive: every block above already rounds to whole counts, but guarantee it
+    # centrally too, so artificial doublets are always true integer counts (not just
+    # numerically-whole floats) going into normalize_total/log1p/PCA downstream.
+    final_X.data = np.rint(final_X.data).astype(np.int64)
     return {"counts": final_X, "origins": results_origins, "types": results_types}
-
-
-def add_doublets_to_adata(adata, clusters_col=None, n_doublets=None, verbose=True):
-    """
-    High-level wrapper to add artificial doublets to an AnnData object.
-    
-    This closely mimics `addDoublets` in R, utilizing Scanpy for dependencies.
-    
-    Parameters
-    ----------
-    adata : AnnData
-        Annotated data matrix.
-    clusters_col : str, optional
-        Name of column in `adata.obs` containing cluster labels. 
-        If None, will look for 'clusters' or run simple clustering.
-    n_doublets : int, optional
-        Number of doublets to generate. Default is ~20% of cells if not specified.
-    
-    Returns
-    -------
-    AnnData
-        A new AnnData object containing both Singlets and Doublets.
-        The `.obs` dataframe will have a 'type' column ('singlet', 'doublet').
-    """
-    
-    if n_doublets is None:
-        n_doublets = int(adata.n_obs * 0.2) # Default heuristic
-
-    # 1. Check for clusters
-    clusters = None
-    if clusters_col is not None:
-        if clusters_col in adata.obs:
-            clusters = adata.obs[clusters_col].values
-        else:
-            if verbose: print(f"Column '{clusters_col}' not found in obs.")
-            
-    if clusters is None:
-        if clusters_col is not None and verbose:
-             print(f"Column '{clusters_col}' not found in obs. Doublets will be generated randomly without cluster structure.")
-        elif verbose:
-             print("No clusters provided. Doublets will be generated randomly without cluster structure.")
-            
-    if verbose: print(f"Generating {n_doublets} artificial doublets...")
-    
-    # .X might be dense or sparse
-    X = adata.X
-    res = get_artificial_doublets(X, n=n_doublets, clusters=clusters)
-    
-    min_len = min(res["counts"].shape[0], len(res["origins"]))
-    
-    # 3. Create new AnnData with combined data
-    # Create doublet AnnData
-    X_dbl = res["counts"]
-    obs_dbl = pd.DataFrame(index=[f"art_dbl_{i}" for i in range(X_dbl.shape[0])])
-    obs_dbl["type"] = "doublet"
-    obs_dbl["origin"] = res["origins"]
-    
-    adata_dbl = AnnData(X=X_dbl, obs=obs_dbl)
-    adata_dbl.var = adata.var.copy() # Share gene names
-    
-    # Prepare original AnnData
-    adata_singlets = adata.copy()
-    adata_singlets.obs["type"] = "singlet"
-    adata_singlets.obs["origin"] = clusters if clusters is not None else "real"
-    
-    # Concatenate
-    # This matches the behavior of SingleCellExperiment::cbind
-    return adata_singlets.concatenate(adata_dbl, index_unique=None)

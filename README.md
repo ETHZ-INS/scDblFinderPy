@@ -31,17 +31,31 @@ XGBoost training, threshold optimization) is custom to this package.
 ## Repository layout
 
 ```
-scDblFinderPy/              ← repo root (this directory is the Python package)
-├── pyproject.toml          package metadata + pinned dependency versions
-├── scDblFinder.py          main pipeline — contains compute_doublet_score()
-├── clustering.py           fast_cluster(): scanpy/rapids-singlecell clustering
-├── doublet_generation.py
-├── misc.py                 cxds2, select_features, GPU-backend helpers
-├── thresholding.py
-├── rng.py                  coerce_rng(): numpy Generator seeding helper
+scDblFinderPy/                      ← repo root
+├── pyproject.toml                  package metadata + pinned dependency versions
+├── src/scDblFinderPy/               importable package (src layout)
+│   ├── scDblFinder.py               main pipeline — contains compute_doublet_score()
+│   ├── clustering.py                fast_cluster(): scanpy/rapids-singlecell clustering
+│   ├── doublet_generation.py
+│   ├── misc.py                      cxds2, select_features, GPU-backend helpers
+│   ├── thresholding.py
+│   ├── rng.py                       coerce_rng(): numpy Generator seeding helper
+│   └── __init__.py
 ```
 
 ## Setup
+
+### 0. Requirements
+
+Python **3.12 or later**. The pinned dependency versions below (in
+particular `scanpy==1.12.1` and `numpy==2.4.3`) don't publish wheels for
+Python 3.10 or 3.11, so `pip install .` will fail on those versions with a
+"Could not find a version that satisfies the requirement" error. Check your
+interpreter before creating the virtual environment in step 2:
+
+```bash
+python3 --version   # must be 3.12+
+```
 
 ### 1. Clone the repository
 
@@ -53,7 +67,7 @@ cd scDblFinderPy
 ### 2. Create and activate a virtual environment
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 ```
@@ -72,37 +86,73 @@ This installs the exact dependency versions pinned in `pyproject.toml`
 normal importable package — no `sys.path` hacks needed. See
 [Reproducibility](#reproducibility) below for why the pins matter.
 
-Optional — GPU acceleration (requires a CUDA-capable machine). When
-`use_gpu=True`, clustering/PCA/neighbor search run via `rapids-singlecell`
-and XGBoost trains on the GPU (`device='cuda'`):
+### 4. Optional — GPU acceleration
+
+When `use_gpu=True`, clustering/PCA/neighbor search run via
+`rapids-singlecell` (cuML/cuGraph under the hood) and XGBoost trains on the
+GPU (`device='cuda'`).
+
+**Do not try to `pip install rapids-singlecell cuml` into a plain venv** —
+`cuml`, `cudf`, and `cugraph` are compiled CUDA extensions that NVIDIA
+distributes through conda/mamba, matched to your CUDA toolkit and driver
+version. A bare pip install of these will not work on most machines. The
+supported path is: build the GPU stack with conda first, then layer this
+package's pure-Python dependencies on top with pip — **not** into the venv
+from steps 2–3 above, since that would fight with conda over which
+numpy/scipy/pandas build is active.
+
+**Step 1 — create the conda environment with the RAPIDS GPU stack.** Use the
+[RAPIDS release selector](https://docs.rapids.ai/install/) to get the exact
+`conda create` command for your CUDA toolkit/driver version and Python
+3.12+, selecting at least `cuml` and `cugraph` (this also pulls in `cudf`
+and `cupy` as dependencies). This package was developed and tested against:
 
 ```bash
-pip install .[gpu]
+conda create -n scdblfinder-gpu -c rapidsai -c conda-forge -c nvidia \
+    cuml=26.4 cugraph=26.4 python=3.12 'cuda-version>=12.0,<=13.2'
+conda activate scdblfinder-gpu
 ```
 
-`rapids-singlecell` and `cuml` are not reliably pip-installable in general
-(the available wheels depend on your exact CUDA toolkit version) — NVIDIA's
-recommended path is conda/mamba via the
-[RAPIDS release selector](https://docs.rapids.ai/install/). This package was
-developed and tested against `rapids-singlecell==0.15.0`, `cuml==26.4.0`,
-`cupy==14.0.1` installed that way.
+**Step 2 — layer `rapids-singlecell` and this package's remaining
+dependencies on top, via pip, inside that same conda environment.** Use
+`--no-deps` for this package so pip doesn't try to reinstall numpy/scipy/
+pandas over the versions conda just resolved for the CUDA stack:
+
+```bash
+# rapids-singlecell ships CUDA-version-suffixed PyPI builds; match it to the
+# cuda-version conda just installed (e.g. -cu12 or -cu13):
+pip install rapids-singlecell-cu13 xgboost
+pip install --no-deps .
+# or, for local development: pip install --no-deps -e .
+pip install anndata scanpy scikit-learn statsmodels leidenalg igraph
+```
+
+(`xgboost`'s regular PyPI wheel already includes GPU support via
+`device='cuda'`; RAPIDS' own conda channel also ships a GPU-enabled build if
+you prefer installing it alongside `cuml`/`cugraph` in step 1 instead.)
+
+Verify the install picked up the GPU stack before running anything real:
+
+```bash
+python -c "import rapids_singlecell, cuml, cupy; print('GPU stack OK')"
+```
+
+This was developed and tested against `rapids-singlecell==0.15.0`,
+`cuml==26.4.0`, `cudf==26.4.0`, `cugraph==26.4.0`, `cupy==14.0.1`.
 
 ## Using the package in your own scripts
 
-Once installed (see Setup), import it directly:
+Install directly from GitHub — no local clone needed:
 
-```python
-from scDblFinderPy.scDblFinder import compute_doublet_score
+```bash
+pip install git+https://github.com/ETHZ-INS/scDblFinderPy.git
 ```
 
-If you'd rather not install it — e.g. quick experimentation without
-`pip install` — you can still fall back to adding the repo's **parent**
-directory to `sys.path` (this skips the pinned-version guarantee below,
-since it relies on whatever is already on `sys.path`):
+Or, if you've already cloned it locally (see Setup), `pip install .` /
+`pip install -e .` from the repo root registers the same importable
+package. Either way, import it directly — no `sys.path` hacks required:
 
 ```python
-import sys
-sys.path.insert(0, "/path/to")   # parent of the scDblFinderPy/ directory
 from scDblFinderPy.scDblFinder import compute_doublet_score
 ```
 
@@ -116,8 +166,6 @@ from scDblFinderPy.scDblFinder import compute_doublet_score
 
 ```python
 import scanpy as sc
-import sys
-sys.path.insert(0, "/path/to")
 from scDblFinderPy.scDblFinder import compute_doublet_score
 
 adata = sc.read_h5ad("your_data.h5ad")

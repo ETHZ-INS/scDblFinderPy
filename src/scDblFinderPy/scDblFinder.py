@@ -70,7 +70,6 @@ def compute_doublet_score(
     use_gpu=False,
     random_state=42,
     n_iters=3,
-    clust_cor=None, # clustCor
     prop_random=0, # propRandom (R default, from scDblFinder()'s own signature)
     adjust_size=0.25,
     meta_triplets=True,
@@ -96,19 +95,27 @@ def compute_doublet_score(
     Parameters
     ----------
     adata : AnnData
-        Annotated data matrix with cells as rows (`.obs`) and genes as columns
-        (`.var`), matching the standard AnnData/Scanpy convention. Required:
-        - Raw (unnormalized) integer counts in either `adata.X` or
-          `adata.layers['counts']`. If both are absent/non-integer, a warning
-          is raised and `adata.X` is used as-is (results may be suboptimal).
-        - `adata.var_names` should be gene identifiers (used to align real and
-          artificial-doublet feature spaces).
-        - `adata.obs_names` should be unique cell barcodes/IDs (used to map
-          scores back onto the input after internal processing).
-        - If `clusters_col` names an existing `adata.obs` column, it is used
-          directly as the cluster labels for artificial doublet generation; if
-          it names a column that doesn't yet exist, `fast_cluster` computes
-          and writes cluster labels there (in place, on this same `adata`).
+        Annotated data matrix, shape (n_cells, n_genes), matching the standard
+        AnnData/Scanpy convention (rows = cells in `.obs`, columns = genes in
+        `.var`). Concretely:
+        - Raw (unnormalized, non-negative integer) UMI/read counts, in either
+          `adata.X` or `adata.layers['counts']` — checked in that order, so a
+          `'counts'` layer (if present) takes precedence over `.X`. Do **not**
+          pass log-normalized or scaled data: the pipeline itself normalizes
+          and log-transforms internally (for PCA) while relying on the raw
+          integer values elsewhere (e.g. CXDS scoring, artificial-doublet
+          generation via cell-pair summation). If neither location holds
+          integer counts, a warning is raised and `adata.X` is used as-is
+          (results may be suboptimal).
+        - `adata.var_names`: gene identifiers, unique. Used to align genes
+          between real cells and the artificial doublets generated internally
+          (both must share the same var space).
+        - `adata.obs_names`: unique cell barcodes/IDs. Used to map computed
+          scores back onto the input `adata` after internal processing (which
+          operates on a real+artificial combined copy).
+        - `clusters_col` (see below) reads/writes a column of `adata.obs`,
+          not a separate array — pass the column *name*, not the labels
+          themselves.
     n_neighbors : int, optional
         Number of neighbors for KNN. If None, uses heuristic.
     n_features : int
@@ -125,12 +132,6 @@ def compute_doublet_score(
         Random seed.
     n_iters : int
         Number of iterations for the classifier training.
-    clust_cor : int or matrix, optional
-        Include Spearman correlations to cluster/cell-type marker signatures
-        as additional predictors. If an integer, that many top per-cluster
-        markers are selected and correlated; if a 2D array/DataFrame (genes x
-        cell types), its columns are used directly as marker signatures. Off
-        (`None`) by default, matching R's `clustCor=NULL`.
     prop_random : float
         Proportion of artificial doublets to be made of random cells (as
         opposed to inter-cluster combinations). Ignored (treated as 1) when
@@ -332,89 +333,6 @@ def compute_doublet_score(
     # Restore raw counts on .X (normalize/log1p above ran in place).
     adata_combined.X = adata_combined.layers['counts']
 
-    # Compute cluster-correlations predictors if requested (clustCor in R)
-    # R computes these on the counts matrix before PCA and adds them to the
-    # predictors table. Here we approximate that behavior: when `clust_cor` is
-    # an integer, pick top-n markers per cluster by mean expression; when it is
-    # a 2D array/DataFrame, use its columns as signatures and correlate.
-    if clust_cor is not None and clusters is not None:
-        try:
-            from scipy.stats import rankdata
-            counts_mat = adata_combined.layers['counts'] if 'counts' in adata_combined.layers else adata_combined.X
-            # ensure dense for computations
-            if sp.issparse(counts_mat):
-                counts_dense = counts_mat.toarray()
-            else:
-                counts_dense = np.asarray(counts_mat)
-
-            cluster_labels = np.asarray(clusters)
-            uniq_clusters = np.unique(cluster_labels)
-            clustcor_cols = []
-            if hasattr(clust_cor, 'shape') and len(np.shape(clust_cor)) == 2:
-                # matrix-like: rows should correspond to genes (var_names)
-                if isinstance(clust_cor, pd.DataFrame):
-                    mat = clust_cor.copy()
-                else:
-                    mat = pd.DataFrame(clust_cor, index=adata_combined.var_names)
-                # intersect genes
-                common = np.intersect1d(adata_combined.var_names, mat.index)
-                if len(common) >= 5:
-                    sub_counts = pd.DataFrame(counts_dense[:, [list(adata_combined.var_names).index(g) for g in common]], columns=common)
-                    for col in mat.columns:
-                        sig = mat.loc[common, col].values
-                        # compute Spearman correlation between each cell and signature
-                        # compute ranks
-                        sig_rank = rankdata(sig)
-                        vals = []
-                        for r in range(sub_counts.shape[0]):
-                            cell_rank = rankdata(sub_counts.iloc[r].values)
-                            # Pearson on ranks
-                            num = np.cov(cell_rank, sig_rank, bias=True)[0,1]
-                            den = np.std(cell_rank) * np.std(sig_rank)
-                            vals.append(0.0 if den == 0 else num/den)
-                        colname = f'clustCor_{col}'
-                        adata_combined.obs[colname] = vals
-                        clustcor_cols.append(colname)
-            else:
-                # integer: pick markers per cluster
-                try:
-                    nmark = int(clust_cor)
-                except Exception:
-                    nmark = None
-                if nmark and nmark > 0:
-                    # compute cluster means (cells x genes)
-                    means = {}
-                    markers = set()
-                    for cl in uniq_clusters:
-                        idx = np.where(cluster_labels == cl)[0]
-                        if idx.size == 0:
-                            continue
-                        meanvec = counts_dense[idx].mean(axis=0)
-                        top_idx = np.argsort(meanvec)[-nmark:]
-                        for ti in top_idx:
-                            markers.add(ti)
-                        means[cl] = meanvec
-                    markers = sorted(list(markers))
-                    if len(markers) >= 5:
-                        sub_counts = counts_dense[:, markers]
-                        for cl in uniq_clusters:
-                            sig = means.get(cl, np.zeros(counts_dense.shape[1]))[markers]
-                            sig_rank = rankdata(sig)
-                            vals = []
-                            for r in range(sub_counts.shape[0]):
-                                cell_rank = rankdata(sub_counts[r])
-                                num = np.cov(cell_rank, sig_rank, bias=True)[0,1]
-                                den = np.std(cell_rank) * np.std(sig_rank)
-                                vals.append(0.0 if den == 0 else num/den)
-                            colname = f'clustCor_{cl}'
-                            adata_combined.obs[colname] = vals
-                            clustcor_cols.append(colname)
-            if verbose and len(clustcor_cols)>0:
-                print(f"Added clustCor predictors: {clustcor_cols}")
-        except Exception as e:
-            if verbose:
-                print('Failed to compute clustCor predictors:', e)
-
     # 5. KNN & Doublet Features
     # -------------------------
     if verbose: print("Evaluating KNN features...")
@@ -511,10 +429,6 @@ def compute_doublet_score(
             'nAbove2',
             'cxds_score',
         ]
-        # include any clustCor-derived columns (added earlier) so they are available for training
-        clustcor_cols = [c for c in adata_combined.obs.columns if str(c).startswith('clustCor_')]
-        if clustcor_cols:
-            ordered_candidates = ordered_candidates + clustcor_cols
         feature_cols = [
             c for c in ordered_candidates
             if c in adata_combined.obs.columns
