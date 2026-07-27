@@ -876,10 +876,13 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
             _nw_g    = _w_g / cp.where(_rs_g == 0, 1.0, _rs_g)
             weighted_score = cp.asnumpy(cp.sum(_nt_g.astype(cp.float64) * _nw_g, axis=1))
 
-            # 5. dist to nearest real/doublet — computed here while arrays are on GPU
+            # 5. dist to nearest real/doublet — computed here while arrays are on GPU.
+            # Uses the zero-corrected _sd_g (not raw _d_g), matching R's .evaluateKNN,
+            # which replaces zero distances in knn$distance globally before deriving
+            # both the weighted density and distanceToNearestReal/Doublet from it.
             _max_dist = float(dist_to_k.max()) * 2
-            dist_to_nearest_real    = cp.asnumpy(cp.where(_nt_g == 0, _d_g, _max_dist).min(axis=1))
-            dist_to_nearest_doublet = cp.asnumpy(cp.where(_nt_g == 1, _d_g, _max_dist).min(axis=1))
+            dist_to_nearest_real    = cp.asnumpy(cp.where(_nt_g == 0, _sd_g, _max_dist).min(axis=1))
+            dist_to_nearest_doublet = cp.asnumpy(cp.where(_nt_g == 1, _sd_g, _max_dist).min(axis=1))
 
             # neighbor_types as numpy is needed by section 4 (pandas / Python loops)
             neighbor_types = cp.asnumpy(_nt_g).astype(int)
@@ -978,10 +981,12 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
     # 5. Distance to nearest real / doublet neighbor (self already absent).
     # Fallback for cells with no real/doublet neighbour in k: use 2 × max nearest-neighbour
     # distance, matching R's `md <- max(knn$distance[,1]); dB <- 2*md`.
+    # Uses SAFE_DIST (zero-corrected), not the raw `distances`: R replaces zero
+    # distances in knn$distance globally before deriving distanceToNearestReal/Doublet.
     if not _gpu_knn_feats:
         max_dist                = dist_to_k.max() * 2
-        dist_to_nearest_real    = np.where(neighbor_types == 0, distances, max_dist).min(axis=1)
-        dist_to_nearest_doublet = np.where(neighbor_types == 1, distances, max_dist).min(axis=1)
+        dist_to_nearest_real    = np.where(neighbor_types == 0, SAFE_DIST, max_dist).min(axis=1)
+        dist_to_nearest_doublet = np.where(neighbor_types == 1, SAFE_DIST, max_dist).min(axis=1)
 
     # 6. nAbove2: count of genes with counts > 2 (raw counts, not KNN-derived).
     counts_matrix = adata.layers['counts'] if 'counts' in adata.layers else adata.X

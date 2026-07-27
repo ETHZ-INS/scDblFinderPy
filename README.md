@@ -45,7 +45,7 @@ scDblFinderPy/                      ← repo root
 
 ## Setup
 
-### 0. Requirements
+### Requirements
 
 Python **3.12 or later**. The pinned dependency versions below (in
 particular `scanpy==1.12.1` and `numpy==2.4.3`) don't publish wheels for
