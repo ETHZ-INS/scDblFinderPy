@@ -517,29 +517,51 @@ def compute_doublet_score(
                 'max_depth': max_depth,
                 'learning_rate': eta,
                 'subsample': 0.75,
-                # 'exact' has no GPU implementation; 'hist' runs on both CPU and GPU,
-                # with the actual device selected via the 'device' param below.
-                'tree_method': 'hist' if use_gpu else 'exact',
+                # Always use 'hist' (not 'exact') so CPU and GPU train the same tree
+                # structure; only the 'device' differs. Using 'exact' on CPU would
+                # make the CPU model a genuinely different classifier from the GPU
+                # one, not just a numerically-noisier version of it.
+                'tree_method': 'hist',
+                'device': 'cuda' if use_gpu else 'cpu',
                 'nthread': 1,
                 'seed': random_state,
             }
-            if use_gpu:
-                params['device'] = 'cuda'
 
             if nrounds is None or nrounds < 1:
-                cv_results = xgb.cv(
-                    params,
-                    dtrain,
-                    num_boost_round=200,
-                    nfold=5,
-                    early_stopping_rounds=2,
-                    metrics={score_metric},
-                    seed=random_state,
-                    verbose_eval=False
-                )
                 mean_col = f"test-{score_metric}-mean"
                 std_col = f"test-{score_metric}-std"
-                
+
+                # A single 5-fold CV run's round-by-round curve is noisy enough
+                # (round-to-round wobble comparable in size to the CPU/GPU
+                # 'hist' quantile-sketch numerical differences) that the
+                # "first round under threshold" rule below can pick a
+                # substantially different n_estimators purely from that noise
+                # -- observed as CPU vs GPU choosing e.g. 56 vs 87 rounds on
+                # identical data, which then compounds over the sequential
+                # boosting rounds into a materially different model. Repeating
+                # CV with several folds/seeds and averaging the curves smooths
+                # out that per-round wobble so the crossing point reflects the
+                # true (device-independent) trend instead of the noise.
+                cv_curves = []
+                for _rep in range(3):
+                    cv_seed = int(central_rng.integers(0, 2 ** 31 - 1))
+                    cv_res_rep = xgb.cv(
+                        params,
+                        dtrain,
+                        num_boost_round=200,
+                        nfold=8,
+                        early_stopping_rounds=2,
+                        metrics={score_metric},
+                        seed=cv_seed,
+                        verbose_eval=False
+                    )
+                    cv_curves.append(cv_res_rep)
+
+                min_len = min(len(c) for c in cv_curves)
+                cv_results = pd.concat(
+                    [c.iloc[:min_len].reset_index(drop=True) for c in cv_curves]
+                ).groupby(level=0)[[mean_col, std_col]].mean()
+
                 best_idx = cv_results[mean_col].idxmin()
                 
                 if nrounds == 0 or nrounds is None:

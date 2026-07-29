@@ -21,7 +21,15 @@ def _kmeans_labels(X, k, n_init=3, max_iter=50, seed=0, use_gpu=False):
     if use_gpu:
         try:
             import cuml
-            km = cuml.cluster.KMeans(n_clusters=k, n_init=n_init, max_iter=max_iter, random_state=seed)
+            # cuML's default init='scalable-k-means++' is an approximate
+            # initialization designed for distributed/huge-scale data; on the
+            # small precluster counts used here it's a genuinely different
+            # (noisier) algorithm than sklearn's exact 'k-means++' below, not
+            # just a numerically-noisier version of the same one. Force the
+            # same exact algorithm sklearn uses so the two backends solve the
+            # same clustering problem.
+            km = cuml.cluster.KMeans(n_clusters=k, n_init=n_init, max_iter=max_iter,
+                                      random_state=seed, init='k-means++')
             return np.asarray(km.fit_predict(X)).astype(int)
         except Exception:
             pass
