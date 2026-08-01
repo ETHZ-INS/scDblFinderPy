@@ -1,7 +1,11 @@
 # scDblFinderPy
 
-Python implementation of the scDblFinder workflow for doublet detection in
-single-cell RNA-seq data, designed to run on AnnData/Scanpy objects.
+Python implementation of the
+[scDblFinder](https://github.com/plger/scDblFinder) workflow for doublet
+detection in single-cell RNA-seq data, designed to run on AnnData/Scanpy
+objects. This package reimplements the core algorithms of that R/Bioconductor
+package in Python; see the original repository for the reference
+implementation and further methodological background.
 
 This module mirrors the core ideas of the R package:
 - optional pre-clustering
