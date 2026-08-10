@@ -26,5 +26,8 @@ dependencies = [
 # distributes through conda/mamba rather than PyPI wheels — there is no pip
 # extra for this. See the README's GPU setup section for the conda recipe.
 
+[project.scripts]
+scDblFinderPy = "scDblFinderPy.scDblFinder:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

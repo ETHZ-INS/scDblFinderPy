@@ -1034,3 +1034,90 @@ def _evaluate_knn(adata, n_neighbors=50, use_gpu=False, random_state=42):
     except Exception:
         pass
     return res
+
+
+def _build_arg_parser():
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="scDblFinderPy",
+        description=(
+            "Compute per-cell doublet scores for an AnnData (.h5ad) file "
+            "using the scDblFinderPy pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--adata", required=True,
+        help="Path to the input .h5ad file. Must contain raw counts in "
+             "adata.X or adata.layers['counts'].",
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="Where to write results. A '.csv' path writes only "
+             "obs_names/scDblFinder_score/scDblFinder_class to CSV; a "
+             "'.h5ad' path writes a full AnnData copy with the scores added. "
+             "If omitted, the input file given via --adata is overwritten "
+             "in place with the scores added.",
+    )
+    parser.add_argument("--clusters-col", default=None,
+                         help="Column in adata.obs holding cluster labels (clustered mode). "
+                              "Computed and stored under this name if absent. Omit for random mode (default).")
+    parser.add_argument("--n-neighbors", type=int, default=None,
+                         help="Number of neighbors for KNN. Default: heuristic based on dataset size.")
+    parser.add_argument("--n-features", type=int, default=1352,
+                         help="Number of highly variable genes to use. Default: 1352.")
+    parser.add_argument("--n-components", type=int, default=20,
+                         help="Number of PCA components. Default: 20.")
+    parser.add_argument("--n-artificial", type=int, default=None,
+                         help="Number of artificial doublets to generate. Default: derived from dataset size.")
+    parser.add_argument("--n-iters", type=int, default=3,
+                         help="Number of classifier training iterations. Default: 3.")
+    parser.add_argument("--random-state", type=int, default=42,
+                         help="Random seed. Default: 42.")
+    parser.add_argument("--stringency", type=float, default=0.5,
+                         help="Final thresholding stringency. Default: 0.5.")
+    parser.add_argument("--return-type", choices=["adata", "full"], default="adata",
+                         help="'adata' (default) matches the input; 'full' also includes "
+                              "the artificial doublets (only meaningful with a .h5ad --output).")
+    parser.add_argument("--use-gpu", action="store_true",
+                         help="Run clustering/PCA/KNN/XGBoost on GPU (requires rapids-singlecell/cuml; see README).")
+    parser.add_argument("--quiet", action="store_true",
+                         help="Suppress progress output.")
+    return parser
+
+
+def main(argv=None):
+    """CLI entry point (see also the `scDblFinderPy` console script)."""
+    args = _build_arg_parser().parse_args(argv)
+
+    adata = sc.read_h5ad(args.adata)
+
+    adata_out = compute_doublet_score(
+        adata,
+        n_neighbors=args.n_neighbors,
+        n_features=args.n_features,
+        n_components=args.n_components,
+        n_artificial=args.n_artificial,
+        clusters_col=args.clusters_col,
+        use_gpu=args.use_gpu,
+        random_state=args.random_state,
+        n_iters=args.n_iters,
+        stringency=args.stringency,
+        return_type=args.return_type,
+        verbose=not args.quiet,
+    )
+
+    output = args.output or args.adata
+    if output.endswith(".csv"):
+        adata_out.obs[["scDblFinder_score", "scDblFinder_class"]].to_csv(output, index_label="cell_id")
+    else:
+        adata_out.write_h5ad(output)
+
+    if not args.quiet:
+        print(f"Wrote results to {output} (threshold: {adata_out.uns.get('scDblFinder_threshold')})")
+
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

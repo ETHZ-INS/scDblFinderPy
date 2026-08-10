@@ -26,44 +26,47 @@ At a high level, the pipeline is:
 
 Python **3.12 or later**. The pinned dependency versions below (in
 particular `scanpy==1.12.1` and `numpy==2.4.3`) don't publish wheels for
-Python 3.10 or 3.11, so `pip install .` will fail on those versions with a
+Python 3.10 or 3.11, so installing will fail on those versions with a
 "Could not find a version that satisfies the requirement" error. Check your
-interpreter before creating the virtual environment in step 2:
+interpreter before creating the virtual environment below:
 
 ```bash
 python3 --version   # must be 3.12+
 ```
 
-### 1. Clone the repository
+### Install
 
-```bash
-git clone <repo-url>
-cd scDblFinderPy
-```
-
-### 2. Create and activate a virtual environment
+Install directly from GitHub:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-```
-
-### 3. Install the package
-
-```bash
-pip install .
-# or, for local development (edits take effect without reinstalling):
-pip install -e .
+pip install git+https://github.com/ETHZ-INS/scDblFinderPy.git
 ```
 
 This installs the exact dependency versions pinned in `pyproject.toml`
 (`numpy`, `pandas`, `scipy`, `anndata`, `scanpy`, `scikit-learn`, `xgboost`,
 `statsmodels`, `leidenalg`, `igraph`) and registers `scDblFinderPy` as a
-normal importable package — no `sys.path` hacks needed. See
-[Reproducibility](#reproducibility) below for why the pins matter.
+normal importable package, plus the `scDblFinderPy` CLI command — no
+`sys.path` hacks needed. The versions are pinned exactly, rather than left as
+open ranges, because minor version differences in these libraries can shift
+doublet scores enough to change calls near the threshold — pinning keeps
+results reproducible across machines and over time.
 
-### 4. Optional — GPU acceleration
+If you want to modify the code, or you need a local checkout for the GPU
+setup below, clone the repository and install from it instead:
+
+```bash
+git clone https://github.com/ETHZ-INS/scDblFinderPy.git
+cd scDblFinderPy
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e .   # editable: edits take effect without reinstalling
+```
+
+### Optional — GPU acceleration
 
 When `use_gpu=True`, clustering/PCA/neighbor search run via
 `rapids-singlecell` (cuML/cuGraph under the hood) and XGBoost trains on the
@@ -75,8 +78,8 @@ distributes through conda/mamba, matched to your CUDA toolkit and driver
 version. A bare pip install of these will not work on most machines. The
 supported path is: build the GPU stack with conda first, then layer this
 package's pure-Python dependencies on top with pip — **not** into the venv
-from steps 2–3 above, since that would fight with conda over which
-numpy/scipy/pandas build is active.
+from the Install section above, since that would fight with conda over
+which numpy/scipy/pandas build is active.
 
 **Step 1 — create the conda environment with the RAPIDS GPU stack.** Use the
 [RAPIDS release selector](https://docs.rapids.ai/install/) to get the exact
@@ -117,17 +120,34 @@ python -c "import rapids_singlecell, cuml, cupy; print('GPU stack OK')"
 This was developed and tested against `rapids-singlecell==0.15.0`,
 `cuml==26.4.0`, `cudf==26.4.0`, `cugraph==26.4.0`, `cupy==14.0.1`.
 
-## Using the package in your own scripts
+## Command-line interface
 
-Install directly from GitHub — no local clone needed:
+Installing the package also registers a `scDblFinderPy` command, useful when
+scoring many samples (e.g. in a shell loop) without writing a Python script
+for each one:
 
 ```bash
-pip install git+https://github.com/ETHZ-INS/scDblFinderPy.git
+# Write scores + class into the input file itself (adds/overwrites
+# scDblFinder_score and scDblFinder_class in adata.obs):
+scDblFinderPy --adata sample.h5ad
+
+# Write scores to a separate CSV instead of touching the h5ad file:
+scDblFinderPy --adata sample.h5ad --output doublet_scores.csv
+
+# Batch over many samples:
+for f in samples/*.h5ad; do
+    scDblFinderPy --adata "$f" --output "scores/$(basename "$f" .h5ad).csv"
+done
 ```
 
-Or, if you've already cloned it locally (see Setup), `pip install .` /
-`pip install -e .` from the repo root registers the same importable
-package. Either way, import it directly — no `sys.path` hacks required:
+Run `scDblFinderPy --help` for the full list of options (clustered mode,
+GPU, number of iterations, random seed, etc.) — these mirror the
+`compute_doublet_score(...)` parameters described below.
+
+## Using the package in your own scripts
+
+Once installed (see [Setup](#setup) above), import it directly — no
+`sys.path` hacks required:
 
 ```python
 from scDblFinderPy.scDblFinder import compute_doublet_score
