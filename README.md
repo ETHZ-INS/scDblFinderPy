@@ -138,10 +138,19 @@ scDblFinderPy --adata sample.h5ad --output doublet_scores.csv
 for f in samples/*.h5ad; do
     scDblFinderPy --adata "$f" --output "scores/$(basename "$f" .h5ad).csv"
 done
+
+# Opt in to GPU mode (requires the RAPIDS/cuML setup from the GPU
+# acceleration section above; runs on CPU by default otherwise):
+scDblFinderPy --adata sample.h5ad --use-gpu
 ```
 
+CPU is the default — the CLI only runs on GPU if you pass `--use-gpu`,
+and doing so requires the conda-based RAPIDS stack described in
+[Optional — GPU acceleration](#optional--gpu-acceleration) to already be
+installed in the active environment.
+
 Run `scDblFinderPy --help` for the full list of options (clustered mode,
-GPU, number of iterations, random seed, etc.) — these mirror the
+number of iterations, random seed, etc.) — these mirror the
 `compute_doublet_score(...)` parameters described below.
 
 ## Using the package in your own scripts
