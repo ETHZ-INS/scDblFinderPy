@@ -22,6 +22,19 @@ At a high level, the pipeline is:
 
 ## Setup
 
+There are two independent installation paths below, depending on whether you
+need GPU acceleration:
+- **CPU-only:** a plain `venv`, described in
+  [Install (CPU, via `venv`)](#install-cpu-via-venv).
+- **GPU (`use_gpu=True`):** a `conda` environment, described in
+  [Optional — GPU acceleration (via `conda`)](#optional--gpu-acceleration-via-conda).
+  This is
+  required because the CUDA packages (`cuml`, `cugraph`, etc.) are only
+  distributed via conda, not pip/venv.
+
+Pick one based on your needs — don't mix the two (e.g. don't try to `pip
+install` the GPU stack into the venv from the CPU path).
+
 ### Requirements
 
 Python **3.12 or later**. The pinned dependency versions below (in
@@ -34,7 +47,7 @@ interpreter before creating the virtual environment below:
 python3 --version   # must be 3.12+
 ```
 
-### Install
+### Install (CPU, via `venv`)
 
 Install directly from GitHub:
 
@@ -66,7 +79,7 @@ pip install --upgrade pip
 pip install -e .   # editable: edits take effect without reinstalling
 ```
 
-### Optional — GPU acceleration
+### Optional — GPU acceleration (via `conda`)
 
 When `use_gpu=True`, clustering/PCA/neighbor search run via
 `rapids-singlecell` (cuML/cuGraph under the hood) and XGBoost trains on the
@@ -84,14 +97,24 @@ which numpy/scipy/pandas build is active.
 **Step 1 — create the conda environment with the RAPIDS GPU stack.** Use the
 [RAPIDS release selector](https://docs.rapids.ai/install/) to get the exact
 `conda create` command for your CUDA toolkit/driver version and Python
-3.12+, selecting at least `cuml` and `cugraph` (this also pulls in `cudf`
-and `cupy` as dependencies). This package was developed and tested against:
+3.12+, selecting at least `cuml`, `cugraph`, and `cuvs` (this also pulls in
+`cudf` and `cupy` as dependencies). `cuvs` provides the GPU nearest-neighbor
+search backend `cuml` relies on, so it must be installed alongside `cuml`
+and `cugraph` here. This package was developed and tested against:
 
 ```bash
 conda create -n scdblfinder-gpu -c rapidsai -c conda-forge -c nvidia \
-    cuml=26.4 cugraph=26.4 python=3.12 'cuda-version>=12.0,<=13.2'
+    cuml=26.4 cugraph=26.4 cuvs=26.4 python=3.12 'cuda-version>=12.0,<=13.2'
 conda activate scdblfinder-gpu
 ```
+
+During this step conda may print an "nvidia" channel notice about several
+CUDA packages (`cuda`, `cudnn`, `nccl`, etc.) no longer receiving updates on
+the `nvidia` channel after Aug 7, 2026, and pointing to the `defaults` or
+`conda-forge` channels for future updates. This is an informational notice,
+not an error — existing packages and environments keep working, and it does
+not affect this install. It's only worth acting on if you hit missing
+updates for those packages in a future environment.
 
 **Step 2 — layer `rapids-singlecell` and this package's remaining
 dependencies on top, via pip, inside that same conda environment.** Use
@@ -101,11 +124,19 @@ pandas over the versions conda just resolved for the CUDA stack:
 ```bash
 # rapids-singlecell ships CUDA-version-suffixed PyPI builds; match it to the
 # cuda-version conda just installed (e.g. -cu12 or -cu13):
-pip install rapids-singlecell-cu13 xgboost
+pip install rapids-singlecell-cu13 xgboost==3.2.0
 pip install --no-deps .
 # or, for local development: pip install --no-deps -e .
-pip install anndata scanpy scikit-learn statsmodels leidenalg igraph
+pip install anndata==0.12.13 scanpy==1.12.1 scikit-learn==1.8.0 \
+    statsmodels==0.14.6 leidenalg==0.11.0 igraph==1.0.0
 ```
+
+These versions match the pins in `pyproject.toml` (see the note on pinning
+in the [Install (CPU, via `venv`)](#install-cpu-via-venv) section above) —
+installing
+unpinned versions here risks pulling in newer releases that conflict with
+what `cuml`/`rapids-singlecell` expect, or that shift doublet scores
+relative to the tested configuration.
 
 (`xgboost`'s regular PyPI wheel already includes GPU support via
 `device='cuda'`; RAPIDS' own conda channel also ships a GPU-enabled build if
@@ -118,7 +149,8 @@ python -c "import rapids_singlecell, cuml, cupy; print('GPU stack OK')"
 ```
 
 This was developed and tested against `rapids-singlecell==0.15.0`,
-`cuml==26.4.0`, `cudf==26.4.0`, `cugraph==26.4.0`, `cupy==14.0.1`.
+`cuml==26.4.0`, `cudf==26.4.0`, `cugraph==26.4.0`, `cuvs==26.4.0`,
+`cupy==14.0.1`.
 
 ## Command-line interface
 
@@ -146,8 +178,8 @@ scDblFinderPy --adata sample.h5ad --use-gpu
 
 CPU is the default — the CLI only runs on GPU if you pass `--use-gpu`,
 and doing so requires the conda-based RAPIDS stack described in
-[Optional — GPU acceleration](#optional--gpu-acceleration) to already be
-installed in the active environment.
+[Optional — GPU acceleration (via `conda`)](#optional--gpu-acceleration-via-conda)
+to already be installed in the active environment.
 
 Run `scDblFinderPy --help` for the full list of options (clustered mode,
 number of iterations, random seed, etc.) — these mirror the

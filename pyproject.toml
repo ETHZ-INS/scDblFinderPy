@@ -22,9 +22,10 @@ dependencies = [
 ]
 
 # GPU acceleration (use_gpu=True) additionally requires rapids-singlecell,
-# cuml, cudf and cugraph, which are compiled CUDA extensions that NVIDIA
-# distributes through conda/mamba rather than PyPI wheels — there is no pip
-# extra for this. See the README's GPU setup section for the conda recipe.
+# cuml, cudf, cugraph and cuvs, which are compiled CUDA extensions that
+# NVIDIA distributes through conda/mamba rather than PyPI wheels — there is
+# no pip extra for this. See the README's GPU setup section for the conda
+# recipe.
 
 [project.scripts]
 scDblFinderPy = "scDblFinderPy.scDblFinder:main"
