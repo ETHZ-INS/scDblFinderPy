@@ -38,7 +38,7 @@ def _kmeans_labels(X, k, n_init=3, max_iter=50, seed=0, use_gpu=False):
     return km.fit_predict(X).astype(int)
 
 
-def _louvain_labels(X, n_units, resolution=1.0, graph_k=None):
+def _louvain_labels(X, n_units, resolution=1.0, graph_k=None, seed=0):
     """
     Build a small KNN graph over `X` (n_units x n_dims) and cluster it with
     Louvain community detection, mirroring R's
@@ -47,6 +47,7 @@ def _louvain_labels(X, n_units, resolution=1.0, graph_k=None):
     Blondel et al. algorithm R's `igraph::cluster_louvain` calls, so this
     reproduces that step without needing a separate Louvain package.
     """
+    import random
     import igraph as ig
     from sklearn.neighbors import NearestNeighbors
 
@@ -66,7 +67,16 @@ def _louvain_labels(X, n_units, resolution=1.0, graph_k=None):
             edges.add((i, j) if i < j else (j, i))
 
     g = ig.Graph(n=n_units, edges=list(edges))
-    membership = g.community_multilevel(resolution=resolution).membership
+    # community_multilevel takes no seed of its own - igraph's C core draws
+    # from Python's stdlib `random` module by default, so determinism
+    # requires seeding that module directly around the call. State is saved
+    # and restored so this doesn't leak into unrelated code using `random`.
+    state = random.getstate()
+    try:
+        random.seed(seed)
+        membership = g.community_multilevel(resolution=resolution).membership
+    finally:
+        random.setstate(state)
     return np.asarray(membership, dtype=int)
 
 
@@ -183,7 +193,7 @@ def fast_cluster(adata, n_components=30, n_features=1000, key_added='clusters',
         n_groups = n_cells
 
     if verbose: print("Building KNN graph over meta-cells and running Louvain clustering...")
-    meta_membership = _louvain_labels(meta_X, n_groups, resolution=resolution)
+    meta_membership = _louvain_labels(meta_X, n_groups, resolution=resolution, seed=seed)
 
     labels = meta_membership[precluster_pos]
     adata.obs[key_added] = labels.astype(str)
