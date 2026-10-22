@@ -9,3 +9,4 @@ from .thresholding import (
     optim_threshold,
 )
 from .misc import cxds2, select_features
+from .smoothing import smooth_doublet_scores

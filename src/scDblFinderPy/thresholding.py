@@ -90,12 +90,19 @@ def _prop_dev(type_is_real, score, expected, threshold):
     return float(np.min(np.abs(x - expected) / expected))
 
 
-def optim_threshold(data, dbr=None, dbr_sd=None, stringency=0.5, dbr_per1k=0.008):
+def optim_threshold(data, dbr=None, dbr_sd=None, stringency=0.5, dbr_per1k=0.008,
+                     dbr_importance=1.0):
     """
     Optimize threshold using the R `.optimThreshold` cost structure.
 
     Required columns: `type`, `src`, `score`.
     Optional columns: `cluster`, `include.in.training`, `sample`.
+
+    `dbr_importance` (R: `dbr.importance`) scales the weight of the
+    expected-doublet-rate deviation term in the cost function, in [0, 1]
+    (0 = ignored, 1 = as important as the FNR/FPR terms). Callers doing
+    iterative re-thresholding (e.g. the training-exclusion step in
+    `compute_doublet_score`) may pass a decayed value here.
     """
     if not (0.0 < stringency < 1.0):
         raise ValueError("`stringency` should be >0 and <1.")
@@ -141,7 +148,7 @@ def optim_threshold(data, dbr=None, dbr_sd=None, stringency=0.5, dbr_per1k=0.008
     type_is_real = d["type_is_real"].to_numpy(dtype=bool)
 
     def cost_fn(th):
-        dev = _prop_dev(type_is_real, scores, expected, th) ** 2
+        dev = dbr_importance * (_prop_dev(type_is_real, scores, expected, th) ** 2)
         val = dev + 2.0 * (1.0 - stringency) * _fnr(type_is_real, scores, th, expected_fn=efn)
         if include_mask.size > 0:
             val += 2.0 * stringency * _fpr(type_is_real[include_mask], scores[include_mask], th)
@@ -153,7 +160,8 @@ def optim_threshold(data, dbr=None, dbr_sd=None, stringency=0.5, dbr_per1k=0.008
     return float(res.x)
 
 
-def doublet_thresholding_optim(data, dbr=None, dbr_sd=None, stringency=0.5, dbr_per1k=0.008):
+def doublet_thresholding_optim(data, dbr=None, dbr_sd=None, stringency=0.5, dbr_per1k=0.008,
+                                dbr_importance=1.0):
     """Return both threshold and singlet/doublet calls for the optim method."""
     th = optim_threshold(
         data,
@@ -161,6 +169,7 @@ def doublet_thresholding_optim(data, dbr=None, dbr_sd=None, stringency=0.5, dbr_
         dbr_sd=dbr_sd,
         stringency=stringency,
         dbr_per1k=dbr_per1k,
+        dbr_importance=dbr_importance,
     )
     calls = np.where(np.asarray(data["score"], dtype=float) > th, "doublet", "singlet")
     return th, calls
@@ -239,7 +248,7 @@ def doublet_thresholding_griffiths(data, p=0.1):
 
 def doublet_thresholding(data, method="auto", dbr=None, dbr_sd=None,
                           stringency=0.5, p=0.1, dbr_per1k=0.008,
-                          return_type="call"):
+                          dbr_importance=1.0, return_type="call"):
     """
     Dispatcher for doublet thresholding. Mirrors R's doubletThresholding().
 
@@ -261,6 +270,9 @@ def doublet_thresholding(data, method="auto", dbr=None, dbr_sd=None,
         P-value threshold for griffiths method.
     dbr_per1k : float
         Doublet rate per 1000 cells (used when dbr is None).
+    dbr_importance : float
+        Weight, in [0, 1], of the expected-doublet-rate deviation term in
+        the optim cost function (optim only; 0 = ignored, 1 = full weight).
     return_type : str
         'call' (default) returns singlet/doublet labels.
         'threshold' returns the numeric threshold(s).
@@ -283,7 +295,8 @@ def doublet_thresholding(data, method="auto", dbr=None, dbr_sd=None,
 
     if method == "optim":
         th, calls = doublet_thresholding_optim(
-            data, dbr=dbr, dbr_sd=dbr_sd, stringency=stringency, dbr_per1k=dbr_per1k
+            data, dbr=dbr, dbr_sd=dbr_sd, stringency=stringency, dbr_per1k=dbr_per1k,
+            dbr_importance=dbr_importance,
         )
         return th if return_type == "threshold" else calls
 

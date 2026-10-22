@@ -84,6 +84,7 @@ def compute_doublet_score(
     dbr=None,
     dbr_sd=None,
     dbr_per1k=0.008,
+    decay_dbr=True,
     stringency=0.5,
     return_type='adata',
     verbose=True,
@@ -143,6 +144,13 @@ def compute_doublet_score(
         Error metric for XGBoost (e.g. 'logloss').
     training_features : list or str
         Features to use for training. 'default' uses standard set.
+    decay_dbr : bool
+        Whether the expected-doublet-rate prior's influence on the
+        per-iteration training-exclusion threshold decays across training
+        iterations (halved after each iteration, starting at full weight).
+        This only affects which cells get excluded from training at each
+        step, not the final threshold computed after the loop (which always
+        uses full weight). Default True.
     return_type : str
         'adata': matches input, adds scores.
         'full': returns the extended AnnData with artificial doublets.
@@ -453,6 +461,12 @@ def compute_doublet_score(
     real_mask_all = adata_combined.obs['type'].values == 'real'
     dbl_mask_all = ~real_mask_all
 
+    # R-style decaying weight on the expected-doublet-rate prior, used only
+    # for the per-iteration training-exclusion threshold below (not the
+    # final threshold computed after the loop). Starts at full weight and
+    # halves each iteration when decay_dbr=True.
+    dbr_importance = 1.0
+
     for i in range(n_iters):
         if verbose:
             print(f"Training iteration {i+1}/{n_iters}...")
@@ -474,6 +488,7 @@ def compute_doublet_score(
             dbr_sd=dbr_sd_eff,
             dbr_per1k=dbr_per1k,
             stringency=0.7,
+            dbr_importance=dbr_importance,
         )
         calls_iter = np.asarray(calls_iter)
 
@@ -481,7 +496,10 @@ def compute_doublet_score(
         w1_mask = real_mask_all & (calls_iter == 'doublet')
         n_real = int(np.sum(real_mask_all))
         if np.sum(w1_mask) > (n_real / 3.0):
-            cap_n = int(np.floor(0.2 * n_real))
+            # As dbr_importance decays, the max allowed exclusion ratio grows
+            # towards 0.5 (R: maxDblRatio <- pmin(0.5, 0.2/dbr.importance)).
+            max_dbl_ratio = min(0.5, 0.2 / dbr_importance)
+            cap_n = int(np.floor(max_dbl_ratio * n_real))
             real_idx = np.where(real_mask_all)[0]
             ord_idx = real_idx[np.argsort(-scores[real_idx])]
             keep_idx = ord_idx[:cap_n]
@@ -745,6 +763,9 @@ def compute_doublet_score(
                     dbl_mask_all = np.asarray(dbl_mask_all, dtype=bool)[keep_mask]
                     X_full = X_full[keep_mask]
                     y = np.asarray(y, dtype=int)[keep_mask]
+
+        if decay_dbr:
+            dbr_importance /= 2.0
 
     # 7. Thresholding (optim)
     # -----------------------

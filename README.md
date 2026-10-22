@@ -242,6 +242,47 @@ In `adata.uns`:
 
 If `return_type='full'`, the returned object also includes artificial doublets.
 
+## Smoothing doublet scores
+
+`smooth_doublet_scores(...)` is an optional post-hoc step, ported from R's
+`smoothDoubletScores()`. Like its R counterpart, it is **not** called
+automatically by `compute_doublet_score` — call it explicitly afterwards if
+you want it. It blends each cell's doublet score (in logit space) with a
+distance-weighted consensus of its neighbors in some embedding (PCA by
+default), which amplifies coherent clusters of high-probability doublets
+while suppressing isolated, noisy-looking predictions:
+
+```python
+from scDblFinderPy import compute_doublet_score, smooth_doublet_scores
+
+adata_out = compute_doublet_score(adata, clusters_col=None, random_state=42)
+
+# compute_doublet_score does not retain a PCA embedding on its output, so
+# compute/attach one first (e.g. via scanpy) if you don't already have one:
+import scanpy as sc
+sc.pp.normalize_total(adata_out)
+sc.pp.log1p(adata_out)
+sc.pp.pca(adata_out, n_comps=20)
+
+adata_out = smooth_doublet_scores(adata_out, coords="X_pca", k=20)
+print(adata_out.obs[["scDblFinder_score", "smoothedDoubletScore"]].head())
+```
+
+It also works directly on a plain array of scores plus a coordinate matrix
+(or a precomputed `{"index": ..., "distance": ...}` neighbor dict), without
+needing an `AnnData`:
+
+```python
+from scDblFinderPy import smooth_doublet_scores
+
+smoothed = smooth_doublet_scores(doublet_scores, coords=pca_coords, k=20)
+```
+
+Key parameters: `alpha` (0-1, blend between a cell's own score and its
+neighborhood's) and `gamma` (>= 1, amplifies coherent high-probability
+neighborhoods when > 1). See the function's docstring for the full
+parameter list (`decay_by_distance`, `weights`, etc.).
+
 ## Notes and current limitations
 
 - Multi-sample mode (R's `samples`/`multiSampleMode` arguments) is not
