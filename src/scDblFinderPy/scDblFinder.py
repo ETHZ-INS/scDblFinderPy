@@ -78,6 +78,7 @@ def compute_doublet_score(
     nrounds=0.25,
     max_depth=4,
     eta=0.3,
+    reg_lambda=500,
     filter_unidentifiable=True,
     unident_th=None,
     training_features='default', # trainingFeatures
@@ -142,6 +143,12 @@ def compute_doublet_score(
         (the remainder are selected by overall/per-cluster expression).
     score_metric : str
         Error metric for XGBoost (e.g. 'logloss').
+    reg_lambda : float
+        L2 regularization on XGBoost leaf weights. Departs from R, which
+        leaves XGBoost's default (1): artificial doublets are only a proxy
+        for real ones, and stronger shrinkage improves AUPRC on real-doublet
+        benchmarks (notably PBMC) at the cost of more boosting rounds being
+        selected by CV (roughly 1.5-3x runtime). Set to 1 to match R.
     training_features : list or str
         Features to use for training. 'default' uses standard set.
     decay_dbr : bool
@@ -534,6 +541,7 @@ def compute_doublet_score(
                 'eval_metric': score_metric,
                 'max_depth': max_depth,
                 'learning_rate': eta,
+                'lambda': reg_lambda,
                 'subsample': 0.75,
                 # Always use 'hist' (not 'exact') so CPU and GPU train the same tree
                 # structure; only the 'device' differs. Using 'exact' on CPU would
