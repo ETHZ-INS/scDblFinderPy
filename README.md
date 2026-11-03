@@ -13,6 +13,14 @@ Given a count matrix in an `AnnData` object, scDblFinderPy estimates a
 doublet score for each real cell and returns a final class (`doublet` or
 `singlet`).
 
+The returned real-cell `.obs` also includes
+`scDblFinder_mostLikelyOrigin` (the inferred source-cluster combination) and
+`scDblFinder_originAmbiguous` (the internal ambiguity flag). These are
+predictions, not confirmed cell identities, and are not masked by the final
+singlet/doublet call. An origin can be missing when no origin is available.
+Both fields are returned with `return_type='adata'` and for real cells with
+`return_type='full'`.
+
 At a high level, the pipeline is:
 1. Optional clustering of real cells (clustered mode).
 2. Feature selection and artificial doublet generation.
