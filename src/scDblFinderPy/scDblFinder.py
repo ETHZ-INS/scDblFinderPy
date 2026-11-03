@@ -168,6 +168,10 @@ def compute_doublet_score(
     -------
     AnnData
         The input AnnData with 'scDblFinder_score' and 'scDblFinder_class' in `.obs`.
+        Also adds 'scDblFinder_mostLikelyOrigin' and
+        'scDblFinder_originAmbiguous' for real cells. Origins are inferred
+        independently of the final class, so they may also be present for
+        singlets or missing when no origin is available.
         If return_type='full', returns combined object.
     """
 
@@ -821,6 +825,20 @@ def compute_doublet_score(
     final_calls_real = final_calls_all[real_mask]
     ser_calls = pd.Series(final_calls_real, index=orig_indices)
     adata_orig.obs['scDblFinder_class'] = pd.Categorical(ser_calls.reindex(adata_orig.obs_names).values)
+
+    for source, target in (
+        ('most_likely_origin', 'scDblFinder_mostLikelyOrigin'),
+        ('origin_ambiguous', 'scDblFinder_originAmbiguous'),
+    ):
+        values = pd.Series(
+            adata_combined.obs.loc[real_mask, source].to_numpy(),
+            index=orig_indices,
+        )
+        aligned = values.reindex(adata_orig.obs_names)
+        adata_orig.obs[target] = (
+            pd.Categorical(aligned) if source == 'most_likely_origin'
+            else aligned.to_numpy()
+        )
 
     adata_orig.uns['scDblFinder_threshold'] = float(final_threshold)
     
