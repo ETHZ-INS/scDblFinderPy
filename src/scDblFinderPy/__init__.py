@@ -10,3 +10,4 @@ from .thresholding import (
 )
 from .misc import cxds2, select_features
 from .smoothing import smooth_doublet_scores
+from .enrichment import doublet_pairwise_enrichment
