@@ -28,6 +28,59 @@ At a high level, the pipeline is:
 4. Iterative XGBoost training and score refinement.
 5. Final thresholding to obtain doublet calls.
 
+## Pairwise Origin enrichment
+
+Cluster-based detection now saves native per-pair statistics in
+`adata_out.uns["scDblFinder_origin_stats"]`. Test them without rerunning
+detection:
+
+```python
+from scDblFinderPy import compute_doublet_score, doublet_pairwise_enrichment
+
+adata_out = compute_doublet_score(adata, clusters_col="celltype", random_state=123)
+enrichment = doublet_pairwise_enrichment(adata_out)
+enrichment.to_csv("origin_enrichment.csv", index=False)
+significant = enrichment.loc[enrichment["FDR"] < 0.05]
+```
+
+Alternatively, pass a DataFrame with `combination`, `observed`, `expected`
+and `difficulty` columns (including statistics exported from R).
+Run separately for each capture and seed, not on three-seed consensus sets.
+The detector exports statistics for both `return_type="adata"` and `"full"`;
+random mode (`clusters_col=None`) does not provide pair statistics.
+Older outputs containing only scores/classes/Origins require a new detection
+run. Exporting statistics does not alter scores, training or thresholds.
+
+The default follows **scDblFinder 1.20.2**
+[`doubletPairwiseEnrichment`](https://github.com/plger/scDblFinder):
+
+- Raw expectation: `2 * n(A) * n(B) * dbr / n_cells` for heterotypic pairs.
+- Difficulty: median final detector difficulty per inferred pair, including
+  real and retained artificial cells.
+- Estimate negative-binomial dispersion against the raw expectation
+  (`MASS::theta.ml`), then fit a no-intercept log-link GLM with
+  `log(expected)` offset and `log(difficulty)` predictor.
+- Test the adjusted expectation with strict upper-tail Poisson probabilities
+  `P(X > observed)`, as in R, and Holm multiple-testing correction.
+- Report `log2((observed+1)/(adjusted_expected+1))`. Negative effects receive
+  p=1. The R-compatible column `FDR` is actually a **Holm-adjusted p-value
+  controlling family-wise error**, not a BH FDR.
+
+`incl_diff=False` explicitly tests unadjusted expected counts and does not
+require difficulty. Other R test types, lower-tail and pooled-sample options
+are not implemented. Missing/zero/non-finite difficulty raises: no imputation,
+automatic exclusion or silent statistical fallback is performed. Filtering
+to valid pairs explicitly changes both the fitted model and correction family.
+Degenerate inputs or non-convergent fits raise; dispersion iteration limits
+emit a warning.
+
+This reimplements the statistical method, **not R/Python detector parity**.
+Different upstream predictions or difficulty estimates yield different
+enrichment. Enrichment does not establish physical cell-cell interaction.
+Numerical reference tests use R scDblFinder 1.20.2 outputs; no R runtime is
+required. Implementation references are credited in `enrichment.py`; this
+project and the reference scDblFinder package use GPL-3.
+
 ## Setup
 
 There are two independent installation paths below, depending on whether you

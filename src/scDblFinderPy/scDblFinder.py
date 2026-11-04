@@ -172,6 +172,9 @@ def compute_doublet_score(
         'scDblFinder_originAmbiguous' for real cells. Origins are inferred
         independently of the final class, so they may also be present for
         singlets or missing when no origin is available.
+        Clustered runs also save per-pair observed/expected counts and
+        detection difficulty in uns['scDblFinder_origin_stats'] for
+        doublet_pairwise_enrichment. No enrichment is run automatically.
         If return_type='full', returns combined object.
     """
 
@@ -841,10 +844,34 @@ def compute_doublet_score(
         )
 
     adata_orig.uns['scDblFinder_threshold'] = float(final_threshold)
+    if clusters is not None:
+        from .doublet_generation import get_expected_doublets
+
+        expectations = get_expected_doublets(
+            np.asarray(clusters).astype(str), dbr=dbr, dbr_per_1k=dbr_per1k
+        )
+        native_origins = adata_combined.obs['most_likely_origin']
+        difficulty_by_origin = adata_combined.obs.groupby(
+            'most_likely_origin', observed=True
+        )['difficulty'].median()
+        called_origins = native_origins[
+            np.asarray(real_mask) & (np.asarray(scores) >= final_threshold)
+        ].value_counts()
+        origin_stats = []
+        for pair, expected in expectations.items():
+            origin_stats.append({
+                'combination': pair,
+                'observed': int(called_origins.get(pair, 0)),
+                'expected': expected,
+                'difficulty': float(difficulty_by_origin.get(pair, np.nan)),
+            })
+        adata_orig.uns['scDblFinder_origin_stats'] = pd.DataFrame(origin_stats)
     
     if return_type == 'full':
         # Add artificial to orig
         adata_all = sc.concat([adata_orig, adata_combined[~real_mask].copy()], join='outer')
+        if 'scDblFinder_origin_stats' in adata_orig.uns:
+            adata_all.uns['scDblFinder_origin_stats'] = adata_orig.uns['scDblFinder_origin_stats'].copy()
         return adata_all
     
     return adata_orig

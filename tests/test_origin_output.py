@@ -74,10 +74,27 @@ def test_real_cell_origins_match_internal_values(
         assert "most_likely_origin" in result.obs
     else:
         assert result.shape == data.shape
+    if clusters_col:
+        stats = result.uns["scDblFinder_origin_stats"]
+        assert stats.combination.tolist() == ["Tcell+Tumor"]
+        assert stats.expected.item() == pytest.approx(2 * 40 * 40 * .00064 / 80)
+        expected_count = (
+            real_obs.scDblFinder_class.eq("doublet")
+            & real_obs.scDblFinder_mostLikelyOrigin.eq("Tcell+Tumor")
+        ).sum()
+        assert stats.observed.item() == expected_count
+        assert 0 < stats.difficulty.item() <= 1
+    else:
+        assert "scDblFinder_origin_stats" not in result.uns
     if return_type == "adata":
         path = tmp_path / "origins.h5ad"
         result.write_h5ad(path)
         restored = read_h5ad(path)
+        if clusters_col:
+            pd.testing.assert_frame_equal(
+                restored.uns["scDblFinder_origin_stats"], stats,
+                check_dtype=False,
+            )
         for column in expected:
             pd.testing.assert_series_equal(
                 restored.obs[column], real_obs[column],
